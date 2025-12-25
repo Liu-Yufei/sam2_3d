@@ -173,6 +173,8 @@ def load_video_frames(
     video_path,
     image_size,
     offload_video_to_cpu,
+    frame_list=None,
+    mask_path=None,
     img_mean=(0.485, 0.456, 0.406),
     img_std=(0.229, 0.224, 0.225),
     async_loading_frames=False,
@@ -197,7 +199,9 @@ def load_video_frames(
     elif is_str and os.path.isdir(video_path):
         return load_video_frames_from_jpg_images(
             video_path=video_path,
+            mask_path=mask_path,
             image_size=image_size,
+            frame_list=frame_list,
             offload_video_to_cpu=offload_video_to_cpu,
             img_mean=img_mean,
             img_std=img_std,
@@ -210,10 +214,13 @@ def load_video_frames(
         )
 
 
+
 def load_video_frames_from_jpg_images(
     video_path,
     image_size,
     offload_video_to_cpu,
+    frame_list=None,
+    mask_path=None,
     img_mean=(0.485, 0.456, 0.406),
     img_std=(0.229, 0.224, 0.225),
     async_loading_frames=False,
@@ -239,17 +246,20 @@ def load_video_frames_from_jpg_images(
             "where `-q:v` generates high-quality JPEG frames and `-start_number 0` asks "
             "ffmpeg to start the JPEG file from 00000.jpg."
         )
-
-    frame_names = [
-        p
-        for p in os.listdir(jpg_folder)
-        if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
-    ]
+    if frame_list is not None:
+        frame_names = [f'{x:05d}.jpg' for x in frame_list]
+    else:
+        frame_names = [
+            p
+            for p in os.listdir(jpg_folder)
+            if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
+        ]
     frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
     num_frames = len(frame_names)
     if num_frames == 0:
         raise RuntimeError(f"no images found in {jpg_folder}")
     img_paths = [os.path.join(jpg_folder, frame_name) for frame_name in frame_names]
+    mask_paths = [os.path.join(mask_path, frame_name.replace('.jpg','.png')) for frame_name in frame_names] if mask_path is not None else None
     img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
     img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
 
@@ -265,15 +275,26 @@ def load_video_frames_from_jpg_images(
         return lazy_images, lazy_images.video_height, lazy_images.video_width
 
     images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float32)
+    if mask_paths is not None:
+        masks = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float32)
     for n, img_path in enumerate(tqdm(img_paths, desc="frame loading (JPEG)")):
         images[n], video_height, video_width = _load_img_as_tensor(img_path, image_size)
+        if mask_paths is not None:
+            masks[n], _, _ = _load_img_as_tensor(mask_paths[n], image_size)
+            # images[n] = torch.cat([images[n], mask[0:1]], dim=0)  # add mask as 4th channel
     if not offload_video_to_cpu:
         images = images.to(compute_device)
         img_mean = img_mean.to(compute_device)
         img_std = img_std.to(compute_device)
+        if mask_paths is not None:
+            masks = masks.to(compute_device)
     # normalize by mean and std
     images -= img_mean
     images /= img_std
+    if mask_paths is not None:
+        masks -= img_mean
+        masks /= img_std
+        return images, video_height, video_width, masks
     return images, video_height, video_width
 
 

@@ -42,19 +42,33 @@ class SAM2VideoPredictor(SAM2Base):
     def init_state(
         self,
         video_path,
+        frame_list=None,
+        mask_path=None,
         offload_video_to_cpu=False,
         offload_state_to_cpu=False,
         async_loading_frames=False,
     ):
         """Initialize an inference state."""
         compute_device = self.device  # device of the model
-        images, video_height, video_width = load_video_frames(
-            video_path=video_path,
-            image_size=self.image_size,
-            offload_video_to_cpu=offload_video_to_cpu,
-            async_loading_frames=async_loading_frames,
-            compute_device=compute_device,
-        )
+        if mask_path is None:
+            images, video_height, video_width = load_video_frames(
+                video_path=video_path,
+                image_size=self.image_size,
+                frame_list=frame_list,
+                offload_video_to_cpu=offload_video_to_cpu,
+                async_loading_frames=async_loading_frames,
+                compute_device=compute_device,
+            )
+        else:
+            images, video_height, video_width, masks = load_video_frames(
+                video_path=video_path,
+                mask_path=mask_path,
+                image_size=self.image_size,
+                frame_list=frame_list,
+                offload_video_to_cpu=offload_video_to_cpu,
+                async_loading_frames=async_loading_frames,
+                compute_device=compute_device,
+            )
         inference_state = {}
         inference_state["images"] = images
         inference_state["num_frames"] = len(images)
@@ -96,6 +110,8 @@ class SAM2VideoPredictor(SAM2Base):
         inference_state["frames_tracked_per_obj"] = {}
         # Warm up the visual backbone and cache the image feature on frame 0
         self._get_image_feature(inference_state, frame_idx=0, batch_size=1)
+        if mask_path is not None:
+            return inference_state, masks
         return inference_state
 
     @classmethod
@@ -238,7 +254,7 @@ class SAM2VideoPredictor(SAM2Base):
         else:
             reverse = obj_frames_tracked[frame_idx]["reverse"]
         obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
-        obj_temp_output_dict = inference_state["temp_output_dict_per_obj"][obj_idx]
+        obj_temp_output_dict = inference_state["temp_output_dict_per_obj"][obj_idx]  # 创建引用
         # Add a frame to conditioning output if it's an initial conditioning frame or
         # if the model sees all frames receiving clicks/mask as conditioning frames.
         is_cond = is_init_cond_frame or self.add_all_frames_to_correct_as_cond

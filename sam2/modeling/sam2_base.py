@@ -24,7 +24,7 @@ class SAM2Base(torch.nn.Module):
         self,
         image_encoder,
         memory_attention,
-        memory_encoder,
+        memory_encoder, # sam2.1_hiera_l.yaml: sam2.modeling.memory_encoder.MemoryEncoder
         num_maskmem=7,  # default 1 input frame + 6 previous frames
         image_size=512,
         backbone_stride=16,  # stride of the image backbone output

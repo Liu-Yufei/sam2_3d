@@ -146,11 +146,11 @@ class MemoryEncoder(nn.Module):
     ):
         super().__init__()
 
-        self.mask_downsampler = mask_downsampler
+        self.mask_downsampler = mask_downsampler # cnn
 
         self.pix_feat_proj = nn.Conv2d(in_dim, in_dim, kernel_size=1)
-        self.fuser = fuser
-        self.position_encoding = position_encoding
+        self.fuser = fuser # cnn
+        self.position_encoding = position_encoding # PositionEmbeddingSine 对于相同尺寸的输入，生成的位置编码是完全相同的。
         self.out_proj = nn.Identity()
         if out_dim != in_dim:
             self.out_proj = nn.Conv2d(in_dim, out_dim, kernel_size=1)
@@ -176,6 +176,6 @@ class MemoryEncoder(nn.Module):
         x = self.fuser(x)
         x = self.out_proj(x)
 
-        pos = self.position_encoding(x).to(x.dtype)
+        pos = self.position_encoding(x).to(x.dtype) # 记忆位置编码（Memory Position Encoding），它为编码后的记忆特征提供空间位置信息。
 
         return {"vision_features": x, "vision_pos_enc": [pos]}
