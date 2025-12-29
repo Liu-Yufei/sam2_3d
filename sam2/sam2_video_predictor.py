@@ -184,6 +184,8 @@ class SAM2VideoPredictor(SAM2Base):
         clear_old_points=True,
         normalize_coords=True,
         box=None,
+        support_feature = None,
+        support_mask = None,
     ):
         """Add new points to a frame."""
         obj_idx = self._obj_id_to_idx(inference_state, obj_id)
@@ -276,6 +278,23 @@ class SAM2VideoPredictor(SAM2Base):
             prev_sam_mask_logits = prev_out["pred_masks"].to(device, non_blocking=True)
             # Clamp the scale of prev_sam_mask_logits to avoid rare numerical issues.
             prev_sam_mask_logits = torch.clamp(prev_sam_mask_logits, -32.0, 32.0)
+        if support_feature is not None and support_mask is not None:
+            def get_fg_feat(support_feat, feat_mask):
+                '''
+                input:
+                    support_feat: (H, W, C)
+                    feat_mask: (H, W)
+                output:
+                    fg_feat: (1, C)
+                '''
+                feat_mask_tmp = feat_mask[0].clone().detach().unsqueeze(0).unsqueeze(0)
+                feat_mask_tmp = F.interpolate(feat_mask_tmp, size=support_feat.shape[0: 2], mode="bilinear")
+                feat_mask_tmp = feat_mask_tmp.squeeze()
+                fg_feat = support_feat[feat_mask_tmp>0]
+                fg_feat_embedding = fg_feat.mean(0).unsqueeze(0)  # (1, C)
+                fg_feat = fg_feat_embedding / fg_feat_embedding.norm(dim=-1, keepdim=True)
+                return fg_feat
+            sup_fg_feat = get_fg_feat(support_feature, support_mask)
         current_out, _ = self._run_single_frame_inference(
             inference_state=inference_state,
             output_dict=obj_output_dict,  # run on the slice of a single object
@@ -291,6 +310,7 @@ class SAM2VideoPredictor(SAM2Base):
             # them into memory.
             run_mem_encoder=False,
             prev_sam_mask_logits=prev_sam_mask_logits,
+            sup_fg_feat=sup_fg_feat,
         )
         # Add the output to the output dict (to be used as future memory)
         obj_temp_output_dict[storage_key][frame_idx] = current_out
@@ -762,6 +782,7 @@ class SAM2VideoPredictor(SAM2Base):
         reverse,
         run_mem_encoder,
         prev_sam_mask_logits=None,
+        sup_fg_feat=None,
     ):
         """Run tracking on a single frame based on current inputs and previous memory."""
         # Retrieve correct image features
@@ -788,6 +809,7 @@ class SAM2VideoPredictor(SAM2Base):
             track_in_reverse=reverse,
             run_mem_encoder=run_mem_encoder,
             prev_sam_mask_logits=prev_sam_mask_logits,
+            sup_fg_feat=sup_fg_feat,
         )
 
         # optionally offload the output to CPU memory to save GPU space

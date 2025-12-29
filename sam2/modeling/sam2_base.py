@@ -254,6 +254,10 @@ class SAM2Base(torch.nn.Module):
         else:
             self.obj_ptr_tpos_proj = torch.nn.Identity()
 
+    def _post_process_sam_masks(self):
+        """Post-process SAM output masks (a placeholder for potential future usage)."""
+        pass
+
     def _forward_sam_heads(
         self,
         backbone_features,
@@ -261,6 +265,7 @@ class SAM2Base(torch.nn.Module):
         mask_inputs=None,
         high_res_features=None,
         multimask_output=False,
+        sup_fg_feat=None,
     ):
         """
         Forward SAM prompt encoders and mask heads.
@@ -379,15 +384,58 @@ class SAM2Base(torch.nn.Module):
 
         sam_output_token = sam_output_tokens[:, 0]
         if multimask_output:
-            # take the best mask prediction (with the highest IoU estimation)
-            best_iou_inds = torch.argmax(ious, dim=-1)
-            batch_inds = torch.arange(B, device=device)
-            low_res_masks = low_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
-            high_res_masks = high_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
-            if sam_output_tokens.size(1) > 1:
-                sam_output_token = sam_output_tokens[batch_inds, best_iou_inds]
+
+            '''三个output的前景和support feature 前景 作比较。看哪个效果好'''
+            # post_process
+            if sup_fg_feat is not None:
+                def get_fg_feat(support_feat, feat_mask):
+                    '''
+                    input:
+                        support_feat: (H, W, C)
+                        feat_mask: (H, W)
+                    output:
+                        fg_feat: (1, C)
+                    '''
+                    feat_mask_tmp = feat_mask[0].clone().detach().unsqueeze(0).unsqueeze(0)
+                    feat_mask_tmp = F.interpolate(feat_mask_tmp, size=support_feat.shape[0: 2], mode="bilinear")
+                    feat_mask_tmp = feat_mask_tmp.squeeze()
+                    fg_feat = support_feat[feat_mask_tmp>0]
+                    fg_feat_embedding = fg_feat.mean(0).unsqueeze(0)  # (1, C)
+                    fg_feat = fg_feat_embedding / fg_feat_embedding.norm(dim=-1, keepdim=True)
+                    return fg_feat
+                def similarity(feat1, feat2):
+                    '''
+                    inputs:
+                        feat1: (N_1, 1)
+                        feat2: (1, N_2)
+                    outputs:
+                        sim: (N_1, N_2)
+                    '''
+                    sim = (feat1 @ feat2).to(feat1.dtype)  # (N, M)
+                    return sim
+                import numpy as np
+                best_sim_score = []
+                for i in range(3):
+                    que_fg_feat = get_fg_feat(backbone_features.squeeze().permute(1, 2, 0), low_res_multimasks[0][i:i+1])  # (C, 1)
+                    best_sim_score.append(similarity(sup_fg_feat, que_fg_feat.permute(1,0)).mean().cpu()) # [n,1] @ [1.N] -> [1]
+                best_idx = np.argmax(best_sim_score)
+                batch_inds = torch.arange(B, device=device)
+
+                low_res_masks = low_res_multimasks[batch_inds, best_idx].unsqueeze(1)
+                high_res_masks = high_res_multimasks[batch_inds, best_idx].unsqueeze(1)
+                if sam_output_tokens.size(1) > 1:
+                    sam_output_token = sam_output_tokens[batch_inds, best_idx]
+            else:
+                # take the best mask prediction (with the highest IoU estimation)
+                best_iou_inds = torch.argmax(ious, dim=-1)
+                batch_inds = torch.arange(B, device=device)
+                low_res_masks = low_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
+                high_res_masks = high_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
+                if sam_output_tokens.size(1) > 1:
+                    sam_output_token = sam_output_tokens[batch_inds, best_iou_inds]
         else:
             low_res_masks, high_res_masks = low_res_multimasks, high_res_multimasks
+
 
         # Extract object pointer from the SAM output token (with occlusion handling)
         obj_ptr = self.obj_ptr_proj(sam_output_token)
@@ -738,6 +786,7 @@ class SAM2Base(torch.nn.Module):
         num_frames,
         track_in_reverse,
         prev_sam_mask_logits,
+        sup_fg_feat=None,
     ):
         current_out = {"point_inputs": point_inputs, "mask_inputs": mask_inputs}
         # High-resolution feature maps for the SAM head, reshape (HW)BC => BCHW
@@ -782,6 +831,7 @@ class SAM2Base(torch.nn.Module):
                 mask_inputs=mask_inputs,
                 high_res_features=high_res_features,
                 multimask_output=multimask_output,
+                sup_fg_feat=sup_fg_feat,
             )
 
         return current_out, sam_outputs, high_res_features, pix_feat
@@ -831,6 +881,7 @@ class SAM2Base(torch.nn.Module):
         run_mem_encoder=True,
         # The previously predicted SAM mask logits (which can be fed together with new clicks in demo).
         prev_sam_mask_logits=None,
+        sup_fg_feat=None,
     ):
         current_out, sam_outputs, _, _ = self._track_step(
             frame_idx,
@@ -844,6 +895,7 @@ class SAM2Base(torch.nn.Module):
             num_frames,
             track_in_reverse,
             prev_sam_mask_logits,
+            sup_fg_feat=sup_fg_feat,
         )
 
         (

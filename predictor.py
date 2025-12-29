@@ -25,16 +25,17 @@ def get_arguments():
     parser.add_argument('--ckpt', type=str, default="/media/DATA1/lyf/few-shot-training-free/sam2_2d/checkpoints/sam2.1_hiera_large.pt")
     # parser.add_argument('--ref_idx', type=str, default='00')
     parser.add_argument('--model_cfg', type=str, default="configs/sam2.1/sam2.1_hiera_l.yaml")
-    parser.add_argument('--ablation', type=int, default=0)
     parser.add_argument('--wandb', type=bool, default=False)
     parser.add_argument('--dino', type=int, default=3)
     parser.add_argument('--dinov3', type=bool, default=True)
-    parser.add_argument('--delta_1', type=float, default=0.75)
-    parser.add_argument('--delta_2', type=float, default=0)
-    parser.add_argument('--left', type=float, default=-1.5)
-    parser.add_argument('--right', type=float, default=-0.25)
-    parser.add_argument('--step', type=float, default=0.25)
     parser.add_argument('--fold', type=int, default=5)
+    parser.add_argument('--delta_1', type=float, default=0.25)
+    parser.add_argument('--delta_2', type=float, default=0.25)
+    parser.add_argument('--multiple', type=int, default=4)
+    parser.add_argument('--left', type=float, default=-1.0)
+    parser.add_argument('--right', type=float, default=0.25)
+    parser.add_argument('--step', type=float, default=0.25)
+    parser.add_argument('--p_t', type=int, default=0)
     args = parser.parse_args()
     return args
 
@@ -211,58 +212,138 @@ def get_selected_frame(frame_list, n_shot = 3):
     selected_frames = [f'{x:05d}.jpg' for x in selected_frames]
     return selected_frames
 
-def select_prompts( support_features, selected_query_features, feat_masks, prompt_list, frame_start_idx, org_hw, org_image,frame_path,frame_0):
+def get_fg_feat(support_feat, feat_mask):
+    '''
+    input:
+        support_feat: (H, W, C)
+        feat_mask: (H, W)
+    output:
+        fg_feat: (1, C)
+    '''
+    fg_feat = support_feat[feat_mask>0]
+    fg_feat_embedding = fg_feat.mean(0).unsqueeze(0)  # (1, C)
+    fg_feat = fg_feat_embedding / fg_feat_embedding.norm(dim=-1, keepdim=True)
+    return fg_feat
+
+def get_bg_feat(support_feat, feat_mask):
+    '''
+    input:
+        support_feat: (H, W, C)
+        feat_mask: (H, W)
+    output:
+        bg_feat: (C, N)
+    '''
+    bg_feat = support_feat[feat_mask<=0]
+    bg_feat = bg_feat.permute(1,0)
+    bg_feat = bg_feat / bg_feat.norm(dim=0, keepdim=True)
+    return bg_feat
+
+def norm_query_feat(query_feat, C, h, w):
+    '''
+    input:
+        query_feat: (C, H, W)
+    output:
+        query_feat: (C, H*W)
+    '''
+    query_feat = query_feat / query_feat.norm(dim=0, keepdim=True)
+    query_feat = query_feat.reshape(C, h*w)
+    return query_feat
+
+def similarity(feat1, feat2):
+    '''
+    inputs:
+        feat1: (1, C) or (C, )
+        feat2: (C, N)
+    outputs:
+        sim: (1, N)
+    '''
+    sim = (feat1 @ feat2).to(feat1.dtype)  # (N, M)
+    return sim
+
+def get_all_similarity(support_feat, query_feat, feat_mask, org_hw):
+    '''
+    inputs:
+        support_feat: (H, W, C)
+        query_feat: (C, H, W)
+        feat_mask: (H, W)
+        org_hw: (org_H, org_W)
+    outputs:
+        fg_bg_sim: (1, 1, 1, N)
+        que_sup_sim: (org_H, org_W)
+    '''
+    C, h, w = query_feat.shape
+    fg_feat = get_fg_feat(support_feat, feat_mask)
+    bg_feat = get_bg_feat(support_feat, feat_mask)
+    query_feat= norm_query_feat(query_feat, C, h, w)  # (C, H, W)
+    
+    fg_bg_sim = similarity(fg_feat, bg_feat)
+    fg_bg_sim = fg_bg_sim.unsqueeze(0).unsqueeze(0)  # (1, N) -> (1,1,1,4034)
+
+    que_sup_sim = similarity(fg_feat, query_feat)
+    que_sup_sim = que_sup_sim.view(1, 1, h, w) # (1, 1, H, W)
+    que_sup_sim = F.interpolate(que_sup_sim, size=org_hw, mode="bilinear", align_corners=False)
+    que_sup_sim = que_sup_sim.squeeze()
+
+    return fg_bg_sim, que_sup_sim
+
+def select_prompts(args, support_features, selected_query_features, support_dino_features, selected_query_dino_features, feat_masks, prompt_list, frame_start_idx, org_hw, org_image,frame_path,frame_0):
     # 对相应的帧取点。
     ann_obj_frame_points_organ = {}
     que_sup_sim_list = []
+    que_sup_dino_sim_list = []
+    que_sup_fusion_sim_list = []
     fg_bg_sim_list = []
-    for i, support_feat in enumerate(support_features):
-        # 对masks进行处理
-        feat_mask = feat_masks[i][0].clone().detach().unsqueeze(0).unsqueeze(0)
-        feat_mask_tmp = F.interpolate(feat_mask, size=support_feat.shape[0: 2], mode="bilinear")
+    fg_bg_dino_sim_list = []
+    fg_bg_fusion_sim_list = []
+    for i, (support_feat, query_feat, support_dino_feat, query_dino_feat, feat_mask) in enumerate(zip(support_features, selected_query_features,support_dino_features,selected_query_dino_features,feat_masks)):
+        feat_mask_tmp = feat_mask[0].clone().detach().unsqueeze(0).unsqueeze(0)
+        feat_mask_tmp = F.interpolate(feat_mask_tmp, size=support_feat.shape[0: 2], mode="bilinear")
         feat_mask_tmp = feat_mask_tmp.squeeze()
 
-        # 对support特征做mask
-        fg_feat = support_feat[feat_mask_tmp>0]
-        fg_feat_embedding = fg_feat.mean(0).unsqueeze(0)  # (1, C)
-        fg_feat = fg_feat_embedding / fg_feat_embedding.norm(dim=-1, keepdim=True)
-
-        bg_feat = support_feat[feat_mask_tmp<=0]
-        bg_feat = bg_feat.permute(1,0)
-        bg_feat = bg_feat / bg_feat.norm(dim=0, keepdim=True)
-
-        query_feat = selected_query_features[i].permute(2,0,1)
-        C, h, w = query_feat.shape
-        query_feat = query_feat / query_feat.norm(dim=0, keepdim=True)
-        query_feat = query_feat.reshape(C, h*w)
-
-        # similarity
-        fg_bg_sim = (fg_feat @ bg_feat).to(fg_feat.dtype)  # (1, N)
-        fg_bg_sim = fg_bg_sim.unsqueeze(0).unsqueeze(0)  # (1,1,1,4034)
-        # fg_bg_sim = F.interpolate(fg_bg_sim, size=org_hw, mode="bilinear", align_corners=False)
-        # fg_bg_sim = fg_bg_sim.squeeze()
+        # ViT_feature:
+        query_feat = query_feat.permute(2,0,1) # (H, W, C) -> (C, H, W)
+        fg_bg_sim, que_sup_sim = get_all_similarity(support_feat, query_feat, feat_mask_tmp, org_hw)
+        
         fg_bg_sim_list.append(fg_bg_sim)
-
-        que_sup_sim = (fg_feat @ query_feat).to(fg_feat.dtype)
-        que_sup_sim = que_sup_sim.view(1,1,h, w)
-        que_sup_sim = F.interpolate(que_sup_sim, size=org_hw, mode="bilinear", align_corners=False)
-        que_sup_sim = que_sup_sim.squeeze()
         que_sup_sim_list.append(que_sup_sim)
 
+        # dino_feature:
+        support_dino_feat = support_dino_feat.permute(1,2,0) # (C, H, W) -> (H, W, C)
+        fg_bg_dino_sim, que_sup_dino_sim = get_all_similarity(support_dino_feat, query_dino_feat, feat_mask_tmp, org_hw)
+
+        fg_bg_dino_sim_list.append(fg_bg_dino_sim)
+        que_sup_dino_sim_list.append(que_sup_dino_sim)
+
+        # fusion 
+        fg_bg_fusion_sim = fg_bg_sim * fg_bg_dino_sim *(1 - args.delta_1 - args.delta_2) + fg_bg_sim * args.delta_1 + fg_bg_dino_sim * args.delta_2
+        que_sup_fusion_sim = que_sup_sim * que_sup_dino_sim *(1 - args.delta_1 - args.delta_2) + que_sup_sim * args.delta_1 + que_sup_dino_sim * args.delta_2
+        h_f, w_f = que_sup_fusion_sim.shape
+        que_sup_fusion_sim = que_sup_fusion_sim.reshape(1, 1, h_f, w_f)
+        que_sup_fusion_sim = F.interpolate(que_sup_fusion_sim, size=org_hw, mode="bilinear", align_corners=False).squeeze()
+        que_sup_fusion_sim_list.append(que_sup_fusion_sim)
+        fg_bg_fusion_sim_list.append(fg_bg_fusion_sim)
+
+        # select fusion prompts
+        if args.p_t >0:
+            p_t = args.p_t
+        else:
+            p_t = min((((que_sup_fusion_sim[que_sup_fusion_sim > 0.75].sum() / que_sup_fusion_sim.sum())* 10).int().item() + 2),3) # 前景占比
+        topk_xy, topk_label, last_xy, last_label = point_selection_fusion(args, que_sup_fusion_sim, fg_bg_fusion_sim, p_t=p_t)
+
         # select prompts
-        topk_xy, topk_label, last_xy, last_label = point_selection(que_sup_sim, fg_bg_sim)
+        # topk_xy, topk_label, last_xy, last_label = point_selection(que_sup_sim, fg_bg_sim)
         prompt_xy = np.concatenate((topk_xy, last_xy), axis=1).squeeze(0)
         prompt_label = np.concatenate((topk_label, last_label), axis=1).squeeze(0)
         ann_obj_frame_points_organ[int(prompt_list[i].split('.')[0])-frame_start_idx] = (prompt_xy, prompt_label)
 
-    return ann_obj_frame_points_organ, fg_bg_sim_list, que_sup_sim_list
+    return ann_obj_frame_points_organ, fg_bg_fusion_sim_list, que_sup_fusion_sim_list
 
 def kmeans_sklearn(data: torch.Tensor, K:int, max_iters = 100):
     data = data.cpu().numpy()
     kmeans = KMeans(n_clusters=K, init='k-means++', max_iter=max_iters, random_state=0).fit(data)
     return torch.tensor(kmeans.cluster_centers_)
 
-def point_selection(sim:torch.Tensor, fg_bg_sim:torch.Tensor, topk=1000, part=2, p_t= 2, t=6):
+def point_selection(sim:torch.Tensor, fg_bg_sim:torch.Tensor, topk=1000, part=2, p_t=2, t=6):
     # Top-1 point selection21
     mask_sim = sim.clone()
     w, h = mask_sim.shape
@@ -310,22 +391,89 @@ def point_selection(sim:torch.Tensor, fg_bg_sim:torch.Tensor, topk=1000, part=2,
     return topk_xy, topk_label, last_xy, last_label
 
 
+def point_selection_fusion(args, sim, sim_bg_fr_fusion, topk=50, part=2, p_t= 2, n_t=4):
+
+    # Top-1 point selection
+    mask_sim = sim.clone()
+    w, h = mask_sim.shape
+    topk_sim, topk_xy = mask_sim.flatten(0).topk(p_t * args.multiple) # 返回最大的topk个值的索引
+    topk_x = (topk_xy // h).unsqueeze(0) # 返回索引对应的行
+    topk_y = (topk_xy - topk_x * h) # 返回索引对应的列
+    topk_xy = torch.cat((topk_y, topk_x), dim=0).permute(1, 0) # 将x,y拼接
+    centers_p = []
+    center_p = kmeans_sklearn(topk_xy, p_t, max_iters=20) 
+    centers_p.append(center_p)
+
+    topk_xy_torch = torch.cat(centers_p, dim=0).to(sim.device)
+    topk_xy = topk_xy_torch.unsqueeze(0).cpu().numpy() # 转为numpy
+    # topk_xy = torch.cat([topk_xy[0:1],topk_xy_torch]).unsqueeze(0).cpu().numpy() # 转为numpy
+
+    topk_label = np.array([1] * topk_xy.shape[1]).reshape(1, topk_xy.shape[1]) # 生成topk个1
+
+    # 计算positive点之间的距离
+    distances_p = np.linalg.norm(center_p[:, np.newaxis] - center_p, axis=-1)
+    max_distance = torch.tensor(np.max(distances_p)).to(sim.device)
+    np.fill_diagonal(distances_p, np.inf)
+    # min_distance = torch.tensor(np.min(distances_p)).to(sim.device)
+
+    # Top-last point selection
+    sim_bg_fr_mean = sim_bg_fr_fusion.mean()
+    sim_bg_fr_std = sim_bg_fr_fusion.std()
+    threshold_low = sim_bg_fr_mean + args.left * sim_bg_fr_std
+    threshold_high = sim_bg_fr_mean + args.right * sim_bg_fr_std
+    centers_n = []
+    # t_final = n_t
+    for i in range(part):
+        threshold_low = threshold_low + args.step * i * sim_bg_fr_std
+        threshold_high = threshold_high + args.step * i * sim_bg_fr_std
+        mask_sim_flat = mask_sim.flatten(0)
+        threshold_mask = (mask_sim_flat >= threshold_low) & (mask_sim_flat <= threshold_high)
+        threshold_indices = torch.nonzero(threshold_mask).squeeze(1) # 返回在阈值范围内的所有值的索引
+        # threshold_indices = threshold_indices[torch.randperm(threshold_indices.size(0))[:topk]] # 随机选取topk个点
+        # threshold_indices = threshold_indices[torch.randperm(threshold_indices.size(0))[:n_t//part*20]] # 随机选取topk个点
+        threshold_x = (threshold_indices // h).unsqueeze(0) # 返回索引对应的行
+        threshold_y = (threshold_indices - threshold_x * h) # 返回索引对应的列
+        threshold_xy = torch.cat((threshold_y, threshold_x), dim=0).permute(1, 0) # 将x,y拼接
+        if topk_xy.shape[1] >1:
+            distances_n_p = torch.cdist(threshold_xy.float(), topk_xy_torch.float(),p=2) # 计算negative点到positive点的距禂
+            valid_mask = torch.all(distances_n_p >= (max_distance), dim=1) # 保证negative点到positive点的距离大于min_distance
+            threshold_xy = threshold_xy[valid_mask]
+        threshold_xy = threshold_xy[torch.randperm(threshold_xy.size(0))[:n_t//part*args.multiple]]
+        # 随机选取threshold_mask中的100个点-
+        threshold_indices_new = threshold_xy[:,0] * h + threshold_xy[:,1]
+         # 将坐标转为索引
+        sim_vals = mask_sim_flat[threshold_indices_new].unsqueeze(1)
+        feature = torch.cat([threshold_xy, sim_vals],dim=1)
+        if threshold_xy.size(0)>2*n_t//part:
+            center = kmeans_sklearn(feature, K=n_t//part, max_iters=20)
+            centers_n.append(center[:, :2].cpu())
+        else:
+            centers_n.append(feature[:, :2].cpu())
+    max_centers = torch.cat(centers_n, dim=0)
+    last_xy = max_centers.cpu().unsqueeze(0).numpy() # 转为numpy
+    last_label = np.array([0] * last_xy.shape[1]).reshape(1,last_xy.shape[1]) # 生成对应数量的0
+    return topk_xy, topk_label, last_xy, last_label
+    
+
+
 
 def sam2_video_inference(ann_obj_frame_points, inference_state, predictor, frame_names, video_dir=None, show_result=False, vis_frame_stride=1, output_path=None):
     # Add all points
-    # for ann_obj_id,frame_points in ann_obj_frame_points.items():
-    if True:
-        ann_obj_id = 0
+    for ann_obj_id,frame_points in ann_obj_frame_points.items():
+    # if True:
+        # ann_obj_id = 0
         frame_points = ann_obj_frame_points
         
-        for ann_frame_idx, (points, labels) in frame_points.items():
+        for i, (ann_frame_idx, (points, labels)) in enumerate(frame_points.items()):
             _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
                 inference_state=inference_state,
                 frame_idx=ann_frame_idx,
                 obj_id=ann_obj_id,
                 points=points,
                 clear_old_points=False,
-                labels=labels
+                labels=labels,
+                support_feature = inference_state['support_features'][i],
+                support_mask = inference_state['support_masks'][i],
             )
             if show_result and (output_path is not None):
                 output_path_fig = os.path.join(output_path, f'frame_{ann_frame_idx:04d}_after_clicks.png')
@@ -340,7 +488,7 @@ def sam2_video_inference(ann_obj_frame_points, inference_state, predictor, frame
                 show_mask((out_mask_logits[out_obj_ids.index(ann_obj_id)] > 0.0).cpu().numpy(), plt.gca(), obj_id=ann_obj_id)
                 plt.savefig(output_path_fig)
                 plt.close()
-            break
+            # break
 
     # run propagation throughout the video and collect the results in a dict
     video_segments = {}  # video_segments contains the per-frame segmentation results
@@ -389,7 +537,7 @@ def main():
     elif args.topic_path=='CHAOS':
         images_path = args.data_path +'/'+ args.topic_path + '/chaos_MR_T2_normalized' + '/images/'
         masks_path = args.data_path + '/'+ args.topic_path + '/chaos_MR_T2_normalized' + '/labels/'
-        # feature_path = args.data_path + '/'+ args.topic_path + '/chaos_MR_T2_normalized' + '/features/'
+        dino_feature_path = args.data_path + '/'+ args.topic_path + '/chaos_MR_T2_normalized' + '/dino_features/'
         json_path = args.data_path + '/'+ args.topic_path + '/chaos_MR_T2_normalized' + '/classmap_1.json'
         label_to_organ = {1: 'LIVER', 2: 'RK', 3: 'LK',4: 'SPLEEN'}
     fold = args.fold
@@ -415,12 +563,16 @@ def main():
             # 找到对应的support frame
             support_video_dir = os.path.join(video_dir, support_case_num, 'images')
             support_mask_dir = os.path.join(video_dir, support_case_num, 'masks', organ)
+            support_dino_feature_dir = os.path.join(dino_feature_path, 'feature_' + support_case_num + '.npy')
             support_frame_list = classmap[organ][support_case_num] #　support list of frame, int list, org idx
             support_list = get_selected_frame(support_frame_list, n_shot = 3) # support list of selected frame, str list, org idx
             inference_state, masks = predictor.init_state(video_path=support_video_dir, frame_list=support_frame_list,mask_path=support_mask_dir)
             support_features = []
+            support_dino_features = []
             feat_masks = []
             predictor.reset_state(inference_state)
+            support_dino_feature = np.load(support_dino_feature_dir)
+            support_dino_feature = torch.from_numpy(support_dino_feature).to(predictor.device)
             with torch.no_grad():
                 for _, frame_path in enumerate(support_list):
                     frame_idx = int(frame_path.split('.')[0])-support_frame_list[0]
@@ -430,11 +582,13 @@ def main():
                     features_org = all_features[-1].permute(1, 2, 0).view(all_features[-1].size(1), all_features[-1].size(2), *feat_sizes[-1])
                     features = features_org.squeeze().permute(1, 2, 0)
                     support_features.append(features) # (64,64,256)
+                    support_dino_features.append(support_dino_feature[frame_idx])
                     feat_masks.append(masks[frame_idx])  # (1, H, W), dist idx
             
-            # for case_num in iter(obj_name_list_fold[fold_idx]):
-            if True:
-                case_num = '5'
+                    
+            for case_num in iter(obj_name_list_fold[fold_idx]):
+            # if True:
+                # case_num = '5'
                 # 对于其中的每个case：(0-39)
                 # 每个organ对应的frame:
                 # case_num = case_name.split('_')[-1].replace('.nii.gz','')
@@ -442,9 +596,16 @@ def main():
                 # frame_list.sort(key=lambda p: int(os.path.splitext(p)[0]))
                 case_video_dir = os.path.join(video_dir, case_num, 'images')
                 case_mask_dir = os.path.join(video_dir, case_num, 'masks', organ)
+                case_dino_feature_dir = os.path.join(dino_feature_path, 'feature_' + case_num + '.npy')
                 inference_state = predictor.init_state(video_path=case_video_dir, frame_list=frame_list)
+                # 更新inference_state，将support_features和support_masks加入进去
+                inference_state['support_features'] = support_features # list of (H, W, C)
+                inference_state['support_masks'] = feat_masks # list of (1, H, W)
                 predictor.reset_state(inference_state)
                 selected_query_features = []
+                selected_query_dino_features = []
+                query_dino_features = np.load(case_dino_feature_dir)
+                query_dino_features = torch.from_numpy(query_dino_features).to(predictor.device)
                 prompt_list = get_selected_frame(frame_list, n_shot = 3)
                 with torch.no_grad():
                     for _, frame_path in enumerate(prompt_list):
@@ -454,11 +615,15 @@ def main():
                         features_org = all_features[-1].permute(1, 2, 0).view(all_features[-1].size(1), all_features[-1].size(2), *feat_sizes[-1]) # [B 1, C 256, H 64, W 64]
                         features = features_org.squeeze().permute(1, 2, 0) # (64,64,256)
                         selected_query_features.append(features)
+                        selected_query_dino_features.append(query_dino_features[frame_idx])
                     # prompt
                     org_hw = inference_state["video_height"], inference_state["video_width"]
                     ann_obj_frame_points, fg_bg_sim_list, que_sup_sim_list = select_prompts(
+                        args,
                         support_features, 
                         selected_query_features, 
+                        support_dino_features,
+                        selected_query_dino_features,
                         feat_masks, 
                         prompt_list, 
                         frame_list[0], 

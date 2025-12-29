@@ -114,7 +114,7 @@ model:
   multimask_output_for_tracking: true
   use_multimask_token_for_obj_ptr: true
   multimask_min_pt_num: 0
-  multimask_max_pt_num: 1
+  multimask_max_pt_num: 10
   use_mlp_for_obj_ptr_proj: true
   # Compilation flag
   compile_image_encoder: False
