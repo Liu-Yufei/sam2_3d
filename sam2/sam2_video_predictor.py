@@ -326,7 +326,8 @@ class SAM2VideoPredictor(SAM2Base):
         _, video_res_masks = self._get_orig_video_res_output(
             inference_state, consolidated_out["pred_masks_video_res"]
         )
-        return frame_idx, obj_ids, video_res_masks
+        mask_score = current_out["mask_score"]
+        return frame_idx, obj_ids, video_res_masks, mask_score
 
     def add_new_points(self, *args, **kwargs):
         """Deprecated method. Please use `add_new_points_or_box` instead."""
@@ -831,12 +832,14 @@ class SAM2VideoPredictor(SAM2Base):
         obj_ptr = current_out["obj_ptr"]
         object_score_logits = current_out["object_score_logits"]
         # make a compact version of this frame's output to reduce the state size
+        mask_score = current_out["mask_score"]
         compact_current_out = {
             "maskmem_features": maskmem_features,
             "maskmem_pos_enc": maskmem_pos_enc,
             "pred_masks": pred_masks,
             "obj_ptr": obj_ptr,
             "object_score_logits": object_score_logits,
+            "mask_score": mask_score,
         }
         return compact_current_out, pred_masks_gpu
 

@@ -385,7 +385,7 @@ class SAM2Base(torch.nn.Module):
         sam_output_token = sam_output_tokens[:, 0]
         if multimask_output:
 
-            '''三个output的前景和support feature 前景 作比较。看哪个效果好'''
+            '''post-process三个output的前景和support feature 前景 作比较。看哪个效果好'''
             # post_process
             if sup_fg_feat is not None:
                 def get_fg_feat(support_feat, feat_mask):
@@ -394,14 +394,14 @@ class SAM2Base(torch.nn.Module):
                         support_feat: (H, W, C)
                         feat_mask: (H, W)
                     output:
-                        fg_feat: (1, C)
+                        bg_feat: (C, N)
                     '''
                     feat_mask_tmp = feat_mask[0].clone().detach().unsqueeze(0).unsqueeze(0)
                     feat_mask_tmp = F.interpolate(feat_mask_tmp, size=support_feat.shape[0: 2], mode="bilinear")
                     feat_mask_tmp = feat_mask_tmp.squeeze()
                     fg_feat = support_feat[feat_mask_tmp>0]
-                    fg_feat_embedding = fg_feat.mean(0).unsqueeze(0)  # (1, C)
-                    fg_feat = fg_feat_embedding / fg_feat_embedding.norm(dim=-1, keepdim=True)
+                    fg_feat = fg_feat.permute(1,0)
+                    fg_feat = fg_feat / fg_feat.norm(dim=0, keepdim=True)
                     return fg_feat
                 def similarity(feat1, feat2):
                     '''
@@ -411,18 +411,55 @@ class SAM2Base(torch.nn.Module):
                     outputs:
                         sim: (N_1, N_2)
                     '''
-                    sim = (feat1 @ feat2).to(feat1.dtype)  # (N, M)
+                    sim = (feat1 @ feat2)
                     return sim
                 import numpy as np
                 best_sim_score = []
                 for i in range(3):
                     que_fg_feat = get_fg_feat(backbone_features.squeeze().permute(1, 2, 0), low_res_multimasks[0][i:i+1])  # (C, 1)
-                    best_sim_score.append(similarity(sup_fg_feat, que_fg_feat.permute(1,0)).mean().cpu()) # [n,1] @ [1.N] -> [1]
-                best_idx = np.argmax(best_sim_score)
+                    best_sim_score.append(similarity(sup_fg_feat, que_fg_feat).mean()) # [n,1] @ [1.N] -> [1]
+                best_idx = torch.argmax(torch.stack(best_sim_score)).item()
                 batch_inds = torch.arange(B, device=device)
+            
+            # if sup_fg_feat is not None:
+            #     # backbone_features: 假设原始是 (1, C, H, W)
+            #     # 我们需要 (C, H, W) 格式方便计算
+            #     feats = backbone_features.squeeze(0) 
+            #     C, H, W = feats.shape
+            #     # 一次性取出 3 个 mask: (3, h, w)
+            #     low_res_masks_batch = low_res_multimasks[0][0:3]
+            #     # 增加维度适配 interpolate: (3, 1, h, w)
+            #     low_res_masks_batch = low_res_masks_batch.unsqueeze(1)
+            #     # 一次性把 3 个 mask 插值到 (H, W)
+            #     # out: (3, 1, H, W)
+            #     masks_high_res = F.interpolate(low_res_masks_batch, size=(H, W), mode="bilinear", align_corners=False)
+            #     # 将 mask 转为 0/1, 并利用广播机制
+            #     # masks: (3, 1, H, W)
+            #     # feats: (C, H, W) -> unsqueeze -> (1, C, H, W)
+            #     # 结果: (3, C, H, W)
+            #     masks = (masks_high_res > 0).float()
+            #     # 分子：加权和 (Batch, Channel, H, W) -> sum over H,W -> (3, C)
+            #     fg_feats_sum = (masks * feats.unsqueeze(0)).sum(dim=[-2, -1]) 
+            #     # 分母：像素数量 (3, 1, H, W) -> sum over H,W -> (3, 1)
+            #     mask_pixel_counts = masks.sum(dim=[-2, -1]) + 1e-6 # 防止除0
+            #     # 得到 3 个前景特征向量: (3, C)
+            #     que_fg_feats = fg_feats_sum / mask_pixel_counts
+            #     # dim=1 表示沿着 Channel 维度归一化
+            #     que_fg_feats = F.normalize(que_fg_feats, p=2, dim=1) # (3, C)
+            #     # sup_fg_feat 假设是 (1, C) 或 (C,)
+            #     # 我们需要做 (1, C) @ (C, 3) -> (1, 3)
+            #     if sup_fg_feat.dim() == 1:
+            #         sup_fg_feat = sup_fg_feat.unsqueeze(0) # 确保是 (1, C)
 
+            #     # 转置 que_fg_feats 变成 (C, 3) 以便矩阵相乘
+            #     sim_scores = torch.mm(sup_fg_feat, que_fg_feats.T) # (1, 3)
+            #     # 此时 sim_scores 在 GPU 上，直接 argmax
+            #     best_idx = torch.argmax(sim_scores).item()
+
+                batch_inds = torch.arange(B, device=device)
                 low_res_masks = low_res_multimasks[batch_inds, best_idx].unsqueeze(1)
                 high_res_masks = high_res_multimasks[batch_inds, best_idx].unsqueeze(1)
+                ious = best_sim_score
                 if sam_output_tokens.size(1) > 1:
                     sam_output_token = sam_output_tokens[batch_inds, best_idx]
             else:
@@ -901,7 +938,7 @@ class SAM2Base(torch.nn.Module):
         (
             _,
             _,
-            _,
+            score,
             low_res_masks,
             high_res_masks,
             obj_ptr,
@@ -911,6 +948,7 @@ class SAM2Base(torch.nn.Module):
         current_out["pred_masks"] = low_res_masks
         current_out["pred_masks_high_res"] = high_res_masks
         current_out["obj_ptr"] = obj_ptr
+        current_out["mask_score"] = score
         if not self.training:
             # Only add this in inference (to avoid unused param in activation checkpointing;
             # it's mainly used in the demo to encode spatial memories w/ consolidated masks)

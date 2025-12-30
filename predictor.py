@@ -1,5 +1,7 @@
+from datetime import datetime
 import json
 import os
+import random
 # if using Apple MPS, fall back to CPU for unsupported ops
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 import numpy as np
@@ -15,6 +17,7 @@ import re
 from sklearn.cluster import KMeans
 from sam2.utils.misc import fill_holes_in_mask_scores
 from sam2.sam2_video_predictor import SAM2VideoPredictor
+import csv
 def get_arguments():
     
     parser = argparse.ArgumentParser()
@@ -31,11 +34,12 @@ def get_arguments():
     parser.add_argument('--fold', type=int, default=5)
     parser.add_argument('--delta_1', type=float, default=0.25)
     parser.add_argument('--delta_2', type=float, default=0.25)
-    parser.add_argument('--multiple', type=int, default=4)
+    parser.add_argument('--multiple', type=int, default=20)
     parser.add_argument('--left', type=float, default=-1.0)
     parser.add_argument('--right', type=float, default=0.25)
     parser.add_argument('--step', type=float, default=0.25)
     parser.add_argument('--p_t', type=int, default=0)
+    parser.add_argument('--calculate_score', type=bool, default=True)
     args = parser.parse_args()
     return args
 
@@ -327,7 +331,7 @@ def select_prompts(args, support_features, selected_query_features, support_dino
         if args.p_t >0:
             p_t = args.p_t
         else:
-            p_t = min((((que_sup_fusion_sim[que_sup_fusion_sim > 0.75].sum() / que_sup_fusion_sim.sum())* 10).int().item() + 2),3) # 前景占比
+            p_t = min((((que_sup_fusion_sim[que_sup_fusion_sim > 0.75].sum() / que_sup_fusion_sim.sum())* 10).int().item() + 2), 3) # 前景占比
         topk_xy, topk_label, last_xy, last_label = point_selection_fusion(args, que_sup_fusion_sim, fg_bg_fusion_sim, p_t=p_t)
 
         # select prompts
@@ -438,7 +442,7 @@ def point_selection_fusion(args, sim, sim_bg_fr_fusion, topk=50, part=2, p_t= 2,
             distances_n_p = torch.cdist(threshold_xy.float(), topk_xy_torch.float(),p=2) # 计算negative点到positive点的距禂
             valid_mask = torch.all(distances_n_p >= (max_distance), dim=1) # 保证negative点到positive点的距离大于min_distance
             threshold_xy = threshold_xy[valid_mask]
-        threshold_xy = threshold_xy[torch.randperm(threshold_xy.size(0))[:n_t//part*args.multiple]]
+        threshold_xy = threshold_xy[torch.randperm(threshold_xy.size(0))[:n_t//part * args.multiple]]
         # 随机选取threshold_mask中的100个点-
         threshold_indices_new = threshold_xy[:,0] * h + threshold_xy[:,1]
          # 将坐标转为索引
@@ -456,16 +460,20 @@ def point_selection_fusion(args, sim, sim_bg_fr_fusion, topk=50, part=2, p_t= 2,
     
 
 
+def metrics(final_mask, test_mask):
+    intersection = np.sum(final_mask * test_mask)
+    dice_score = 2 * intersection / (np.sum(final_mask) + np.sum(test_mask))
+    return dice_score
 
-def sam2_video_inference(ann_obj_frame_points, inference_state, predictor, frame_names, video_dir=None, show_result=False, vis_frame_stride=1, output_path=None):
+def sam2_video_inference(ann_obj_frame_points, inference_state, predictor:SAM2VideoPredictor, frame_names, video_dir=None, show_result=False, vis_frame_stride=1, output_path=None, mask_dir=None):
     # Add all points
-    for ann_obj_id,frame_points in ann_obj_frame_points.items():
-    # if True:
-        # ann_obj_id = 0
+    # for ann_obj_id,frame_points in ann_obj_frame_points.items():
+    if True:
+        ann_obj_id = 0
         frame_points = ann_obj_frame_points
-        
+        score_list = []
         for i, (ann_frame_idx, (points, labels)) in enumerate(frame_points.items()):
-            _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
+            _, out_obj_ids, out_mask_logits, mask_scores = predictor.add_new_points_or_box(
                 inference_state=inference_state,
                 frame_idx=ann_frame_idx,
                 obj_id=ann_obj_id,
@@ -478,9 +486,12 @@ def sam2_video_inference(ann_obj_frame_points, inference_state, predictor, frame
             if show_result and (output_path is not None):
                 output_path_fig = os.path.join(output_path, f'frame_{ann_frame_idx:04d}_after_clicks.png')
                 frame_idx = frame_names[ann_frame_idx]
+                #取出最大的值
+                score = max(mask_scores)
+                score_list.append(score)
                 # show the results on the current (interacted) frame
                 plt.figure(figsize=(9, 6))
-                plt.title(f"frame {ann_frame_idx}")
+                plt.title(f"frame {ann_frame_idx} scores: {score}")
                 plt.imshow(Image.open(os.path.join(video_dir, f'{frame_idx:05d}.jpg')))
                 show_points(points, labels, plt.gca())
                 # for i in range(len(out_obj_ids)):
@@ -489,7 +500,44 @@ def sam2_video_inference(ann_obj_frame_points, inference_state, predictor, frame
                 plt.savefig(output_path_fig)
                 plt.close()
             # break
+        
+        # 移除分数最低的点
+        min_val = min(score_list)
+        if min_val < 60:
+            # list.index(x) 会返回 x 在列表中第一次出现的索引
+            remove_idx = score_list.index(min_val)
+            predictor.reset_state(inference_state)
+            for i, (ann_frame_idx, (points, labels)) in enumerate(frame_points.items()):
+                if i == remove_idx:
+                    continue
+                _, out_obj_ids, out_mask_logits, mask_scores = predictor.add_new_points_or_box(
+                    inference_state=inference_state,
+                    frame_idx=ann_frame_idx,
+                    obj_id=ann_obj_id,
+                    points=points,
+                    clear_old_points=False,
+                    labels=labels,
+                    support_feature = inference_state['support_features'][i],
+                    support_mask = inference_state['support_masks'][i],
+                )
+                # if show_result and (output_path is not None):
+                #     output_path_fig = os.path.join(output_path, f'frame_{ann_frame_idx:04d}_after_clicks.png')
+                #     frame_idx = frame_names[ann_frame_idx]
+                #     #取出最大的值
+                #     score = max(mask_scores)
+                #     score_list.append(score)
+                #     # show the results on the current (interacted) frame
+                #     plt.figure(figsize=(9, 6))
+                #     plt.title(f"frame {ann_frame_idx} scores: {score}")
+                #     plt.imshow(Image.open(os.path.join(video_dir, f'{frame_idx:05d}.jpg')))
+                #     show_points(points, labels, plt.gca())
+                #     # for i in range(len(out_obj_ids)):
+                #     #     show_mask((out_mask_logits[i] > 0.0).cpu().numpy(), plt.gca(), obj_id=out_obj_ids[i])
+                #     show_mask((out_mask_logits[out_obj_ids.index(ann_obj_id)] > 0.0).cpu().numpy(), plt.gca(), obj_id=ann_obj_id)
+                #     plt.savefig(output_path_fig)
+                #     plt.close()
 
+    dice_single_organ_batch = 0.0
     # run propagation throughout the video and collect the results in a dict
     video_segments = {}  # video_segments contains the per-frame segmentation results
     for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
@@ -516,19 +564,41 @@ def sam2_video_inference(ann_obj_frame_points, inference_state, predictor, frame
             plt.figure(figsize=(6, 4))
             plt.title(f"frame {out_frame_idx}")
             plt.imshow(Image.open(os.path.join(video_dir, f'{frame_idx:05d}.jpg')))
-            for out_obj_id, out_mask in video_segments[out_frame_idx].items():
+            for out_obj_id, out_mask in video_segments[out_frame_idx].items(): # 这个obj_id指的是啥啊
+                if mask_dir is not None:
+                    gt_mask = np.array(Image.open(os.path.join(mask_dir, f'{frame_idx:05d}.png')))
+                    gt_mask = (gt_mask > 0).astype(np.uint8)
+                    out_mask = out_mask.astype(np.uint8)
+                    dice_single_organ_batch = dice_single_organ_batch + calculate_dice_scores(out_mask, gt_mask)
                 show_mask(out_mask, plt.gca(), obj_id=out_obj_id)
             output_path_fig = os.path.join(output_path, f'frame_{out_frame_idx:04d}_segmentation.png')
             plt.savefig(output_path_fig)
             plt.close()
-            
+        dice_single_organ_batch = dice_single_organ_batch / (len(frame_names) // vis_frame_stride)
+    return dice_single_organ_batch
+
+def calculate_dice_scores(final_mask, test_mask):
+    intersection = np.sum(final_mask * test_mask)
+    dice_score = 2 * intersection / (np.sum(final_mask) + np.sum(test_mask))
+    return dice_score
+
+def fix_randseed(seed):
+    r""" Set random seeds for reproducibility """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
 def main():
+    fix_randseed(2456) # 1024 ct 2456 mri 
     args = get_arguments()
     # scan all the JPEG frame names in this directory
     sam2_checkpoint = "/media/DATA1/lyf/few-shot-training-free/sam2_2d/checkpoints/sam2.1_hiera_large.pt"
     model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
     video_dir = "/media/DATA1/lyf/few-shot-training-free/data/CHAOS/SAM2_jpgs_1/"
-    
     if args.topic_path=='RawData':
         images_path = args.data_path +'/'+ args.topic_path + '/sabs_CT_normalized' + '/images/'
         masks_path = args.data_path + '/'+ args.topic_path + '/sabs_CT_normalized' + '/labels/'
@@ -556,143 +626,175 @@ def main():
 
     support_scan_list = [obj_name_list[i*list_split_len] for i in range(args.fold)]
     support_scan_list.append(support_scan_list.pop(0))
-    for organ_idx, organ in label_to_organ.items():
-        # 对于每一种organ：
-        for fold_idx in range(fold):
-            support_case_num = support_scan_list[fold_idx]
-            # 找到对应的support frame
-            support_video_dir = os.path.join(video_dir, support_case_num, 'images')
-            support_mask_dir = os.path.join(video_dir, support_case_num, 'masks', organ)
-            support_dino_feature_dir = os.path.join(dino_feature_path, 'feature_' + support_case_num + '.npy')
-            support_frame_list = classmap[organ][support_case_num] #　support list of frame, int list, org idx
-            support_list = get_selected_frame(support_frame_list, n_shot = 3) # support list of selected frame, str list, org idx
-            inference_state, masks = predictor.init_state(video_path=support_video_dir, frame_list=support_frame_list,mask_path=support_mask_dir)
-            support_features = []
-            support_dino_features = []
-            feat_masks = []
-            predictor.reset_state(inference_state)
-            support_dino_feature = np.load(support_dino_feature_dir)
-            support_dino_feature = torch.from_numpy(support_dino_feature).to(predictor.device)
-            with torch.no_grad():
-                for _, frame_path in enumerate(support_list):
-                    frame_idx = int(frame_path.split('.')[0])-support_frame_list[0]
-                    # predictor.reset_state(inference_state)
-                    all_features:torch.Tensor
-                    _,_,all_features,_,feat_sizes = predictor._get_image_feature(inference_state, frame_idx=frame_idx, batch_size=1) # 要对mask对应进行放缩。
-                    features_org = all_features[-1].permute(1, 2, 0).view(all_features[-1].size(1), all_features[-1].size(2), *feat_sizes[-1])
-                    features = features_org.squeeze().permute(1, 2, 0)
-                    support_features.append(features) # (64,64,256)
-                    support_dino_features.append(support_dino_feature[frame_idx])
-                    feat_masks.append(masks[frame_idx])  # (1, H, W), dist idx
-            
-                    
-            for case_num in iter(obj_name_list_fold[fold_idx]):
-            # if True:
-                # case_num = '5'
-                # 对于其中的每个case：(0-39)
-                # 每个organ对应的frame:
-                # case_num = case_name.split('_')[-1].replace('.nii.gz','')
-                frame_list = classmap[organ][case_num]
-                # frame_list.sort(key=lambda p: int(os.path.splitext(p)[0]))
-                case_video_dir = os.path.join(video_dir, case_num, 'images')
-                case_mask_dir = os.path.join(video_dir, case_num, 'masks', organ)
-                case_dino_feature_dir = os.path.join(dino_feature_path, 'feature_' + case_num + '.npy')
-                inference_state = predictor.init_state(video_path=case_video_dir, frame_list=frame_list)
-                # 更新inference_state，将support_features和support_masks加入进去
-                inference_state['support_features'] = support_features # list of (H, W, C)
-                inference_state['support_masks'] = feat_masks # list of (1, H, W)
+    results = {'Image ID':None, 'Organ':None, 'Dice':None}
+    nowtime = datetime.now().strftime('%Y%m%d-%H%M%S')
+    output_path = os.path.join('./output', nowtime, args.outdir , args.topic_path)
+    sum_path = os.path.join(output_path, args.outdir  + 'summary.txt')
+    csv_path = os.path.join(output_path, args.outdir  + '.csv')
+    
+    if not os.path.exists(output_path):
+        os.makedirs(output_path)
+    with open(csv_path, 'w') as file:
+        writer = csv.DictWriter(file, fieldnames=['Image ID', 'Organ', 'Dice','Support_scan','Support_id'])
+        writer.writeheader()
+        for organ_idx, organ in label_to_organ.items():
+            # 对于每一种organ：
+            dice_list = []
+            results['Organ'] = organ
+            for fold_idx in range(fold):
+                support_case_num = support_scan_list[fold_idx]
+                # 找到对应的support frame
+                support_video_dir = os.path.join(video_dir, support_case_num, 'images')
+                support_mask_dir = os.path.join(video_dir, support_case_num, 'masks', organ)
+                support_dino_feature_dir = os.path.join(dino_feature_path, 'feature_' + support_case_num + '.npy')
+                support_frame_list = classmap[organ][support_case_num] #　support list of frame, int list, org idx
+                support_list = get_selected_frame(support_frame_list, n_shot = 3) # support list of selected frame, str list, org idx
+                results['Support_scan'] = support_case_num
+                results['Support_id'] = support_list
+                inference_state, masks = predictor.init_state(video_path=support_video_dir, frame_list=support_frame_list, mask_path=support_mask_dir)
+                support_features = []
+                support_dino_features = []
+                feat_masks = []
                 predictor.reset_state(inference_state)
-                selected_query_features = []
-                selected_query_dino_features = []
-                query_dino_features = np.load(case_dino_feature_dir)
-                query_dino_features = torch.from_numpy(query_dino_features).to(predictor.device)
-                prompt_list = get_selected_frame(frame_list, n_shot = 3)
+                support_dino_feature = np.load(support_dino_feature_dir)
+                support_dino_feature = torch.from_numpy(support_dino_feature).to(predictor.device)
                 with torch.no_grad():
-                    for _, frame_path in enumerate(prompt_list):
-                        frame_idx = int(frame_path.split('.')[0]) - frame_list[0]
+                    for _, frame_path in enumerate(support_list):
+                        frame_idx = int(frame_path.split('.')[0])-support_frame_list[0]
                         # predictor.reset_state(inference_state)
-                        _,_,all_features,_,feat_sizes = predictor._get_image_feature(inference_state, frame_idx=frame_idx, batch_size=1)
-                        features_org = all_features[-1].permute(1, 2, 0).view(all_features[-1].size(1), all_features[-1].size(2), *feat_sizes[-1]) # [B 1, C 256, H 64, W 64]
-                        features = features_org.squeeze().permute(1, 2, 0) # (64,64,256)
-                        selected_query_features.append(features)
-                        selected_query_dino_features.append(query_dino_features[frame_idx])
-                    # prompt
-                    org_hw = inference_state["video_height"], inference_state["video_width"]
-                    ann_obj_frame_points, fg_bg_sim_list, que_sup_sim_list = select_prompts(
-                        args,
-                        support_features, 
-                        selected_query_features, 
-                        support_dino_features,
-                        selected_query_dino_features,
-                        feat_masks, 
-                        prompt_list, 
-                        frame_list[0], 
-                        org_hw,
-                        inference_state["images"],
-                        frame_path,
-                        frame_list[0]
-                    )
-                    for idx, que_sup_sim in enumerate(que_sup_sim_list):
-                        test_idx = int(prompt_list[idx].split('.')[0]) - frame_list[0]
-                        # save_heatmap(
-                        #     test_image = inference_state["images"][frame_idx].permute(1,2,0).cpu().numpy(),
-                        #     sim = que_sup_sim,
-                        #     output_path = os.path.join(args.outdir, case_num, organ, 'heatmaps'),
-                        #     test_idx = test_idx,
-                        #     # ref_idx = [int(f.split('.')[0]) - support_frame_list[0] for f in support_list],
-                        #     sim_bg_fr = fg_bg_sim_list[idx],
-                        #     feat_type = 'ViT'
-                        # )
-                        # show_prompts(
-                        #     inference_state["images"][frame_idx].permute(1,2,0).cpu().numpy(), 
-                        #     test_idx, 
-                        #     ann_obj_frame_points
-                        # )
-                        # show_straits(
-                        #     fg_bg_sim_list[idx],
-                        #     test_idx,
-                        # )
-                        save_all_in_one(
-                            test_image = inference_state["images"][test_idx].permute(1,2,0).cpu().numpy(),
-                            sim = que_sup_sim,
-                            ann_obj_frame_points = ann_obj_frame_points,
-                            test_idx = test_idx,
-                            sim_bg_fr = fg_bg_sim_list[idx],
-                            # output_path = os.path.join(args.outdir, case_num, organ, 'all_in_one'),
-                            output_path = '.',
-                            feat_type = 'ViT'
+                        all_features:torch.Tensor
+                        _,_,all_features,_,feat_sizes = predictor._get_image_feature(inference_state, frame_idx=frame_idx, batch_size=1) # 要对mask对应进行放缩。
+                        features_org = all_features[-1].permute(1, 2, 0).view(all_features[-1].size(1), all_features[-1].size(2), *feat_sizes[-1])
+                        features = features_org.squeeze().permute(1, 2, 0)
+                        support_features.append(features) # (64,64,256)
+                        support_dino_features.append(support_dino_feature[frame_idx])
+                        feat_masks.append(masks[frame_idx])  # (1, H, W), dist idx
+                
+                        
+                for case_num in iter(obj_name_list_fold[fold_idx]):
+                # if True:
+                    # case_num = '5'
+                    # 对于其中的每个case：(0-39)
+                    # 每个organ对应的frame:
+                    # case_num = case_name.split('_')[-1].replace('.nii.gz','')
+                    results['Image ID'] = case_num
+                    frame_list = classmap[organ][case_num]
+                    # frame_list.sort(key=lambda p: int(os.path.splitext(p)[0]))
+                    case_video_dir = os.path.join(video_dir, case_num, 'images')
+                    case_mask_dir = os.path.join(video_dir, case_num, 'masks', organ)
+                    case_dino_feature_dir = os.path.join(dino_feature_path, 'feature_' + case_num + '.npy')
+                    inference_state = predictor.init_state(video_path=case_video_dir, frame_list=frame_list) # masks: [b,c,h,w]
+                    # 更新inference_state，将support_features和support_masks加入进去
+                    inference_state['support_features'] = support_features # list of (H, W, C)
+                    inference_state['support_masks'] = feat_masks # list of (1, H, W)
+                    selected_query_features = []
+                    selected_query_dino_features = []
+                    query_dino_features = np.load(case_dino_feature_dir)
+                    query_dino_features = torch.from_numpy(query_dino_features).to(predictor.device)
+                    prompt_list = get_selected_frame(frame_list, n_shot = 3)
+                    with torch.no_grad():
+                        for _, frame_path in enumerate(prompt_list):
+                            frame_idx = int(frame_path.split('.')[0]) - frame_list[0]
+                            predictor.reset_state(inference_state)
+                            _,_,all_features,_,feat_sizes = predictor._get_image_feature(inference_state, frame_idx=frame_idx, batch_size=1)
+                            features_org = all_features[-1].permute(1, 2, 0).view(all_features[-1].size(1), all_features[-1].size(2), *feat_sizes[-1]) # [B 1, C 256, H 64, W 64]
+                            features = features_org.squeeze().permute(1, 2, 0) # (64,64,256)
+                            selected_query_features.append(features)
+                            selected_query_dino_features.append(query_dino_features[frame_idx])
+                        # prompt
+                        org_hw = inference_state["video_height"], inference_state["video_width"]
+                        ann_obj_frame_points, fg_bg_sim_list, que_sup_sim_list = select_prompts(
+                            args,
+                            support_features, 
+                            selected_query_features, 
+                            support_dino_features,
+                            selected_query_dino_features,
+                            feat_masks, 
+                            prompt_list, 
+                            frame_list[0], 
+                            org_hw,
+                            inference_state["images"],
+                            frame_path,
+                            frame_list[0]
                         )
-                output_path = os.path.join(args.outdir, case_num, organ, 'segmentation')
-                if not os.path.exists(output_path):
-                    os.makedirs(output_path)
-                sam2_video_inference(
-                    ann_obj_frame_points, 
-                    inference_state, 
-                    predictor, 
-                    frame_list, 
-                    case_video_dir, 
-                    show_result=True, 
-                    vis_frame_stride=1,
-                    output_path = output_path
-                )
+                        for idx, que_sup_sim in enumerate(que_sup_sim_list):
+                            test_idx = int(prompt_list[idx].split('.')[0]) - frame_list[0]
+                            # save_heatmap(
+                            #     test_image = inference_state["images"][frame_idx].permute(1,2,0).cpu().numpy(),
+                            #     sim = que_sup_sim,
+                            #     output_path = os.path.join(args.outdir, case_num, organ, 'heatmaps'),
+                            #     test_idx = test_idx,
+                            #     # ref_idx = [int(f.split('.')[0]) - support_frame_list[0] for f in support_list],
+                            #     sim_bg_fr = fg_bg_sim_list[idx],
+                            #     feat_type = 'ViT'
+                            # )
+                            # show_prompts(
+                            #     inference_state["images"][frame_idx].permute(1,2,0).cpu().numpy(), 
+                            #     test_idx, 
+                            #     ann_obj_frame_points
+                            # )
+                            # show_straits(
+                            #     fg_bg_sim_list[idx],
+                            #     test_idx,
+                            # )
+                            save_all_in_one(
+                                test_image = inference_state["images"][test_idx].permute(1,2,0).cpu().numpy(),
+                                sim = que_sup_sim,
+                                ann_obj_frame_points = ann_obj_frame_points,
+                                test_idx = test_idx,
+                                sim_bg_fr = fg_bg_sim_list[idx],
+                                # output_path = os.path.join(args.outdir, case_num, organ, 'all_in_one'),
+                                output_path =  os.path.join(output_path, case_num, organ, 'all_in_one'),
+                                feat_type = 'fusion'
+                            )
+                    output_path_case = os.path.join(output_path, case_num, organ, 'segment_result')
+                    if not os.path.exists(output_path_case):
+                        os.makedirs(output_path_case)
+                    dice_single_organ_batch = sam2_video_inference(
+                        ann_obj_frame_points, 
+                        inference_state, 
+                        predictor, 
+                        frame_list, 
+                        case_video_dir, 
+                        show_result=True, 
+                        vis_frame_stride=1,
+                        output_path = output_path_case,
+                        mask_dir = case_mask_dir
+                    )
 
-                # ann_obj_frame_points[organ_idx]
-    # frame_names = [
-    #     p for p in os.listdir(video_dir)
-    #     if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
-    # ]
-    # frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
+                    results['Dice'] = dice_single_organ_batch
+                    dice_list.append(dice_single_organ_batch)
+                    writer.writerow(results)
+                    # ann_obj_frame_points[organ_idx]
+            
+            f = open(sum_path, 'a')
+            dice_ave = sum(dice_list) / len(dice_list)
+            print(f'Organ: {organ}, Mean Dice: {dice_ave:.4f}', file=f)
+            f.close()
+            del dice_list
 
-    # ann_obj_frame_points = {
-    #     1: {
-    #         7: (np.array([[35, 85],[40, 125],[100,50]], dtype=np.float32),np.array( [1, 0, 0],dtype=np.int32)),
-    #         12: (np.array([[25,75], [48,50], [30,144], [50,100], [100, 150],[200,100],[150,50],[125,175],[60,160]], dtype=np.float32), np.array([1, 1, 1, 1, 0, 0, 0, 0, 0], dtype=np.int32)),
-    #     }
-    #     # ,
-    #     # 2: {
-    #     #     20: (np.array([[320, 200],[310, 300]], dtype=np.float32), np.array([1, 1], dtype=np.int32))
-    #     # }    
-    # }
+    f = open(sum_path, 'a')
+    print("=====================================", file=f)
+    for k,v in vars(args).items():
+        print(f'{k}: {v}', file=f)
+    f.close()
+    print("Done!")
+        # frame_names = [
+        #     p for p in os.listdir(video_dir)
+        #     if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
+        # ]
+        # frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
+
+        # ann_obj_frame_points = {
+        #     1: {
+        #         7: (np.array([[35, 85],[40, 125],[100,50]], dtype=np.float32),np.array( [1, 0, 0],dtype=np.int32)),
+        #         12: (np.array([[25,75], [48,50], [30,144], [50,100], [100, 150],[200,100],[150,50],[125,175],[60,160]], dtype=np.float32), np.array([1, 1, 1, 1, 0, 0, 0, 0, 0], dtype=np.int32)),
+        #     }
+        #     # ,
+        #     # 2: {
+        #     #     20: (np.array([[320, 200],[310, 300]], dtype=np.float32), np.array([1, 1], dtype=np.int32))
+        #     # }    
+        # }
 
 
 
