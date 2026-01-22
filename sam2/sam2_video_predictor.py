@@ -586,6 +586,8 @@ class SAM2VideoPredictor(SAM2Base):
         start_frame_idx=None,
         max_frame_num_to_track=None,
         reverse=False,
+        sup_maskmem_features=None,
+        sup_maskmem_pos_enc=None,
     ):
         """Propagate the input points across frames to track in the entire video."""
         self.propagate_in_video_preflight(inference_state)
@@ -647,6 +649,8 @@ class SAM2VideoPredictor(SAM2Base):
                         mask_inputs=None,
                         reverse=reverse,
                         run_mem_encoder=True,
+                        sup_maskmem_features=sup_maskmem_features,
+                        sup_maskmem_pos_enc=sup_maskmem_pos_enc,
                     )
                     obj_output_dict[storage_key][frame_idx] = current_out
 
@@ -784,6 +788,8 @@ class SAM2VideoPredictor(SAM2Base):
         run_mem_encoder,
         prev_sam_mask_logits=None,
         sup_fg_feat=None,
+        sup_maskmem_features=None,
+        sup_maskmem_pos_enc=None,
     ):
         """Run tracking on a single frame based on current inputs and previous memory."""
         # Retrieve correct image features
@@ -811,6 +817,8 @@ class SAM2VideoPredictor(SAM2Base):
             run_mem_encoder=run_mem_encoder,
             prev_sam_mask_logits=prev_sam_mask_logits,
             sup_fg_feat=sup_fg_feat,
+            sup_maskmem_features=sup_maskmem_features,
+            sup_maskmem_pos_enc=sup_maskmem_pos_enc,
         )
 
         # optionally offload the output to CPU memory to save GPU space

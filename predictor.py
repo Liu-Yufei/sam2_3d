@@ -465,7 +465,18 @@ def metrics(final_mask, test_mask):
     dice_score = 2 * intersection / (np.sum(final_mask) + np.sum(test_mask))
     return dice_score
 
-def sam2_video_inference(ann_obj_frame_points, inference_state, predictor:SAM2VideoPredictor, frame_names, video_dir=None, show_result=False, vis_frame_stride=1, output_path=None, mask_dir=None):
+def sam2_video_inference(
+        ann_obj_frame_points, inference_state, 
+        predictor:SAM2VideoPredictor, 
+        frame_names, 
+        video_dir=None, 
+        show_result=False, 
+        vis_frame_stride=1, 
+        output_path=None, 
+        mask_dir=None,
+        sup_maskmem_features=None,
+        sup_maskmem_pos_enc=None,
+    ):
     # Add all points
     # for ann_obj_id,frame_points in ann_obj_frame_points.items():
     if True:
@@ -540,7 +551,11 @@ def sam2_video_inference(ann_obj_frame_points, inference_state, predictor:SAM2Vi
     dice_single_organ_batch = 0.0
     # run propagation throughout the video and collect the results in a dict
     video_segments = {}  # video_segments contains the per-frame segmentation results
-    for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
+    for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
+        inference_state, 
+        sup_maskmem_features=sup_maskmem_features, 
+        sup_maskmem_pos_enc=sup_maskmem_pos_enc,
+    ):
         video_segments[out_frame_idx] = {
             out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
             for i, out_obj_id in enumerate(out_obj_ids)
@@ -549,12 +564,15 @@ def sam2_video_inference(ann_obj_frame_points, inference_state, predictor:SAM2Vi
     for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(  
         inference_state,  
         # start_frame_idx=150,  
-        reverse=True  # 向前传播  
+        reverse=True,  # 向前传播
+        sup_maskmem_features=sup_maskmem_features,
+        sup_maskmem_pos_enc=sup_maskmem_pos_enc,
     ):  
         video_segments[out_frame_idx] = {  
             out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()  
             for i, out_obj_id in enumerate(out_obj_ids)  
         }
+    
     if show_result and (video_dir is not None):
         # render the segmentation results every few frames
         plt.close("all")
@@ -669,6 +687,40 @@ def main():
                         support_features.append(features) # (64,64,256)
                         support_dino_features.append(support_dino_feature[frame_idx])
                         feat_masks.append(masks[frame_idx])  # (1, H, W), dist idx
+                    
+                    
+                    # get memory bank for each object
+                    # 1、查看未run_frame，是否能够提取出memory features
+                    # 2、修改output的形式，存储到可持续的空间中。
+
+                    obj_idx = predictor._get_obj_num(inference_state)
+                    # Find all the frames that contain temporary outputs for any objects
+                    # (these should be the frames that have just received clicks for mask inputs
+                    # via `add_new_points_or_box` or `add_new_mask`)
+                    object_score_logits = torch.tensor([[10.0]], device=inference_state["device"], dtype=torch.bfloat16)
+                    sup_maskmem_features = []
+                    sup_maskmem_pos_enc = []
+                    for frame_idx in range(len(support_frame_list)):
+                        # Run memory encoder on the temporary outputs (if the memory feature is missing)
+                        # if out["maskmem_features"] is None:
+                        mask = masks[frame_idx][0].unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+                        high_res_masks = torch.nn.functional.interpolate(
+                            mask.to(inference_state["device"]),
+                            size=(predictor.image_size, predictor.image_size),
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                        maskmem_features, maskmem_pos_enc = predictor._run_memory_encoder(
+                            inference_state=inference_state,
+                            frame_idx=frame_idx,
+                            batch_size=1,  # run on the slice of a single object
+                            high_res_masks=high_res_masks,
+                            object_score_logits=object_score_logits, # logits要怎么定义？
+                            # these frames are what the user interacted with
+                            is_mask_from_pts=True,
+                        )
+                        sup_maskmem_features.append(maskmem_features)
+                        sup_maskmem_pos_enc.append(maskmem_pos_enc[0])
                 
                         
                 for case_num in iter(obj_name_list_fold[fold_idx]):
@@ -750,6 +802,8 @@ def main():
                     output_path_case = os.path.join(output_path, case_num, organ, 'segment_result')
                     if not os.path.exists(output_path_case):
                         os.makedirs(output_path_case)
+
+                        
                     dice_single_organ_batch = sam2_video_inference(
                         ann_obj_frame_points, 
                         inference_state, 
@@ -759,7 +813,9 @@ def main():
                         show_result=True, 
                         vis_frame_stride=1,
                         output_path = output_path_case,
-                        mask_dir = case_mask_dir
+                        mask_dir = case_mask_dir,
+                        sup_maskmem_features = sup_maskmem_features,
+                        sup_maskmem_pos_enc = sup_maskmem_pos_enc,
                     )
 
                     results['Dice'] = dice_single_organ_batch
