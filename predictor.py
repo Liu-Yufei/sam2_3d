@@ -35,11 +35,14 @@ def get_arguments():
     parser.add_argument('--delta_1', type=float, default=0.25)
     parser.add_argument('--delta_2', type=float, default=0.25)
     parser.add_argument('--multiple', type=int, default=20)
-    parser.add_argument('--left', type=float, default=-1.0)
-    parser.add_argument('--right', type=float, default=0.25)
+    parser.add_argument('--left', type=float, default=-1.5)
+    parser.add_argument('--right', type=float, default=-0.5)
     parser.add_argument('--step', type=float, default=0.25)
     parser.add_argument('--p_t', type=int, default=0)
     parser.add_argument('--calculate_score', type=bool, default=True)
+    parser.add_argument('--use_erode_mask', type=bool, default=False)
+    parser.add_argument('--kernel_size', type=int, default=5)
+    parser.add_argument('--iters', type=int, default=2)
     args = parser.parse_args()
     return args
 
@@ -466,6 +469,7 @@ def metrics(final_mask, test_mask):
     return dice_score
 
 def sam2_video_inference(
+        args,
         ann_obj_frame_points, inference_state, 
         predictor:SAM2VideoPredictor, 
         frame_names, 
@@ -476,6 +480,8 @@ def sam2_video_inference(
         mask_dir=None,
         sup_maskmem_features=None,
         sup_maskmem_pos_enc=None,
+        sup_maskmem_features_neg=None,
+        sup_maskmem_pos_enc_neg=None,
     ):
     # Add all points
     # for ann_obj_id,frame_points in ann_obj_frame_points.items():
@@ -493,6 +499,8 @@ def sam2_video_inference(
                 labels=labels,
                 support_feature = inference_state['support_features'][i],
                 support_mask = inference_state['support_masks'][i],
+                kernel_size= args.kernel_size,
+                iters = args.iters,
             )
             if show_result and (output_path is not None):
                 output_path_fig = os.path.join(output_path, f'frame_{ann_frame_idx:04d}_after_clicks.png')
@@ -530,6 +538,8 @@ def sam2_video_inference(
                     labels=labels,
                     support_feature = inference_state['support_features'][i],
                     support_mask = inference_state['support_masks'][i],
+                    kernel_size = args.kernel_size,
+                    iters = args.iters,
                 )
                 # if show_result and (output_path is not None):
                 #     output_path_fig = os.path.join(output_path, f'frame_{ann_frame_idx:04d}_after_clicks.png')
@@ -555,6 +565,10 @@ def sam2_video_inference(
         inference_state, 
         sup_maskmem_features=sup_maskmem_features, 
         sup_maskmem_pos_enc=sup_maskmem_pos_enc,
+        sup_maskmem_features_neg=sup_maskmem_features_neg,
+        sup_maskmem_pos_enc_neg=sup_maskmem_pos_enc_neg,
+        iters = args.iters,
+        kernel_size = args.kernel_size,
     ):
         video_segments[out_frame_idx] = {
             out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
@@ -567,6 +581,10 @@ def sam2_video_inference(
         reverse=True,  # 向前传播
         sup_maskmem_features=sup_maskmem_features,
         sup_maskmem_pos_enc=sup_maskmem_pos_enc,
+        sup_maskmem_features_neg=sup_maskmem_features_neg,
+        sup_maskmem_pos_enc_neg=sup_maskmem_pos_enc_neg,
+        kernel_size = args.kernel_size,
+        iters = args.iters,
     ):  
         video_segments[out_frame_idx] = {  
             out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()  
@@ -610,6 +628,25 @@ def fix_randseed(seed):
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
 
+def erode(tensor, pixels=5):
+    """
+    将张量中值为 1 的区域向内腐蚀
+    tensor: shape (1, 1, 1024, 1024)
+    pixels: 腐蚀的像素宽度
+    """
+    k_size = 2 * pixels + 1
+    kernel = torch.ones((1, 1, k_size, k_size), device=tensor.device)
+    
+    padding = pixels
+    
+
+    output = F.conv2d(tensor.float(), kernel, padding=padding)
+    
+
+    eroded_tensor = (output == (k_size**2)).float()
+    
+    return eroded_tensor
+
 def main():
     fix_randseed(2456) # 1024 ct 2456 mri 
     args = get_arguments()
@@ -625,7 +662,7 @@ def main():
     elif args.topic_path=='CHAOS':
         images_path = args.data_path +'/'+ args.topic_path + '/chaos_MR_T2_normalized' + '/images/'
         masks_path = args.data_path + '/'+ args.topic_path + '/chaos_MR_T2_normalized' + '/labels/'
-        dino_feature_path = args.data_path + '/'+ args.topic_path + '/chaos_MR_T2_normalized' + '/dino_features/'
+        dino_feature_path = args.data_path + '/'+ args.topic_path + '/chaos_MR_T2_normalized' + '/dino_features_v3/'
         json_path = args.data_path + '/'+ args.topic_path + '/chaos_MR_T2_normalized' + '/classmap_1.json'
         label_to_organ = {1: 'LIVER', 2: 'RK', 3: 'LK',4: 'SPLEEN'}
     fold = args.fold
@@ -664,12 +701,16 @@ def main():
                 # 找到对应的support frame
                 support_video_dir = os.path.join(video_dir, support_case_num, 'images')
                 support_mask_dir = os.path.join(video_dir, support_case_num, 'masks', organ)
+                support_erode_mask_dir = os.path.join(video_dir, support_case_num, 'eroded_masks_2', organ)
                 support_dino_feature_dir = os.path.join(dino_feature_path, 'feature_' + support_case_num + '.npy')
                 support_frame_list = classmap[organ][support_case_num] #　support list of frame, int list, org idx
                 support_list = get_selected_frame(support_frame_list, n_shot = 3) # support list of selected frame, str list, org idx
                 results['Support_scan'] = support_case_num
                 results['Support_id'] = support_list
-                inference_state, masks = predictor.init_state(video_path=support_video_dir, frame_list=support_frame_list, mask_path=support_mask_dir)
+                if args.use_erode_mask:
+                    inference_state, masks, erode_masks = predictor.init_state(video_path=support_video_dir, frame_list=support_frame_list, mask_path=support_mask_dir, erode_mask_path=support_erode_mask_dir, use_erode_mask=args.use_erode_mask)
+                else:
+                    inference_state, masks = predictor.init_state(video_path=support_video_dir, frame_list=support_frame_list, mask_path=support_mask_dir, use_erode_mask=args.use_erode_mask)
                 support_features = []
                 support_dino_features = []
                 feat_masks = []
@@ -700,16 +741,23 @@ def main():
                     object_score_logits = torch.tensor([[10.0]], device=inference_state["device"], dtype=torch.bfloat16)
                     sup_maskmem_features = []
                     sup_maskmem_pos_enc = []
+                    sup_maskmem_features_neg = []
+                    sup_maskmem_pos_enc_neg = []
                     for frame_idx in range(len(support_frame_list)):
                         # Run memory encoder on the temporary outputs (if the memory feature is missing)
                         # if out["maskmem_features"] is None:
-                        mask = masks[frame_idx][0].unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+                        if args.use_erode_mask:
+                            mask = erode_masks[frame_idx][0].unsqueeze(0).unsqueeze(0) 
+                        else:
+                            mask = masks[frame_idx][0].unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+
                         high_res_masks = torch.nn.functional.interpolate(
                             mask.to(inference_state["device"]),
                             size=(predictor.image_size, predictor.image_size),
                             mode="bilinear",
                             align_corners=False,
                         )
+                        
                         maskmem_features, maskmem_pos_enc = predictor._run_memory_encoder(
                             inference_state=inference_state,
                             frame_idx=frame_idx,
@@ -718,9 +766,25 @@ def main():
                             object_score_logits=object_score_logits, # logits要怎么定义？
                             # these frames are what the user interacted with
                             is_mask_from_pts=True,
+                            kernel_size=args.kernel_size,
+                            iters=args.iters,
                         )
                         sup_maskmem_features.append(maskmem_features)
                         sup_maskmem_pos_enc.append(maskmem_pos_enc[0])
+
+                        maskmem_features_neg, maskmem_pos_enc_neg = predictor._run_memory_encoder(
+                            inference_state=inference_state,
+                            frame_idx=frame_idx,
+                            batch_size=1,  # run on the slice of a single object
+                            high_res_masks= 1 - high_res_masks,
+                            object_score_logits=torch.tensor([[0.0]], device=inference_state["device"], dtype=torch.bfloat16), # logits要怎么定义？
+                            # these frames are what the user interacted with
+                            is_mask_from_pts=True,
+                            kernel_size=args.kernel_size,
+                            iters=args.iters,
+                        )
+                        sup_maskmem_features_neg.append(maskmem_features_neg)
+                        sup_maskmem_pos_enc_neg.append(maskmem_pos_enc_neg[0])
                 
                         
                 for case_num in iter(obj_name_list_fold[fold_idx]):
@@ -805,6 +869,7 @@ def main():
 
                         
                     dice_single_organ_batch = sam2_video_inference(
+                        args,
                         ann_obj_frame_points, 
                         inference_state, 
                         predictor, 
@@ -816,6 +881,8 @@ def main():
                         mask_dir = case_mask_dir,
                         sup_maskmem_features = sup_maskmem_features,
                         sup_maskmem_pos_enc = sup_maskmem_pos_enc,
+                        # sup_maskmem_features_neg = sup_maskmem_features_neg,
+                        # sup_maskmem_pos_enc_neg = sup_maskmem_pos_enc_neg,
                     )
 
                     results['Dice'] = dice_single_organ_batch

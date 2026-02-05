@@ -44,9 +44,11 @@ class SAM2VideoPredictor(SAM2Base):
         video_path,
         frame_list=None,
         mask_path=None,
+        erode_mask_path=None,
         offload_video_to_cpu=False,
         offload_state_to_cpu=False,
         async_loading_frames=False,
+        use_erode_mask=False,
     ):
         """Initialize an inference state."""
         compute_device = self.device  # device of the model
@@ -60,15 +62,28 @@ class SAM2VideoPredictor(SAM2Base):
                 compute_device=compute_device,
             )
         else:
-            images, video_height, video_width, masks = load_video_frames(
-                video_path=video_path,
-                mask_path=mask_path,
-                image_size=self.image_size,
-                frame_list=frame_list,
-                offload_video_to_cpu=offload_video_to_cpu,
-                async_loading_frames=async_loading_frames,
-                compute_device=compute_device,
-            )
+            if use_erode_mask:
+                images, video_height, video_width, masks, erode_masks = load_video_frames(
+                    video_path=video_path,
+                    mask_path=mask_path,
+                    erode_mask_path=erode_mask_path,
+                    image_size=self.image_size,
+                    frame_list=frame_list,
+                    offload_video_to_cpu=offload_video_to_cpu,
+                    async_loading_frames=async_loading_frames,
+                    compute_device=compute_device,
+                    use_erode_mask=use_erode_mask,
+                )
+            else:
+                images, video_height, video_width, masks = load_video_frames(
+                    video_path=video_path,
+                    mask_path=mask_path,
+                    image_size=self.image_size,
+                    frame_list=frame_list,
+                    offload_video_to_cpu=offload_video_to_cpu,
+                    async_loading_frames=async_loading_frames,
+                    compute_device=compute_device,
+                )
         inference_state = {}
         inference_state["images"] = images
         inference_state["num_frames"] = len(images)
@@ -111,7 +126,10 @@ class SAM2VideoPredictor(SAM2Base):
         # Warm up the visual backbone and cache the image feature on frame 0
         self._get_image_feature(inference_state, frame_idx=0, batch_size=1)
         if mask_path is not None:
-            return inference_state, masks
+            if use_erode_mask:
+                return inference_state, masks, erode_masks
+            else:
+                return inference_state, masks
         return inference_state
 
     @classmethod
@@ -186,6 +204,8 @@ class SAM2VideoPredictor(SAM2Base):
         box=None,
         support_feature = None,
         support_mask = None,
+        kernel_size=3,
+        iters=0,
     ):
         """Add new points to a frame."""
         obj_idx = self._obj_id_to_idx(inference_state, obj_id)
@@ -295,6 +315,8 @@ class SAM2VideoPredictor(SAM2Base):
                 fg_feat = fg_feat_embedding / fg_feat_embedding.norm(dim=-1, keepdim=True)
                 return fg_feat
             sup_fg_feat = get_fg_feat(support_feature, support_mask)
+        else:
+            sup_fg_feat = None
         current_out, _ = self._run_single_frame_inference(
             inference_state=inference_state,
             output_dict=obj_output_dict,  # run on the slice of a single object
@@ -311,6 +333,8 @@ class SAM2VideoPredictor(SAM2Base):
             run_mem_encoder=False,
             prev_sam_mask_logits=prev_sam_mask_logits,
             sup_fg_feat=sup_fg_feat,
+            kernel_size=kernel_size,
+            iters=iters,
         )
         # Add the output to the output dict (to be used as future memory)
         obj_temp_output_dict[storage_key][frame_idx] = current_out
@@ -340,6 +364,8 @@ class SAM2VideoPredictor(SAM2Base):
         frame_idx,
         obj_id,
         mask,
+        kernel_size=3,
+        iters=0,
     ):
         """Add new mask to a frame."""
         obj_idx = self._obj_id_to_idx(inference_state, obj_id)
@@ -400,6 +426,8 @@ class SAM2VideoPredictor(SAM2Base):
             # allows us to enforce non-overlapping constraints on all objects before encoding
             # them into memory.
             run_mem_encoder=False,
+            kernel_size=kernel_size,
+            iters=iters,
         )
         # Add the output to the output dict (to be used as future memory)
         obj_temp_output_dict[storage_key][frame_idx] = current_out
@@ -514,7 +542,7 @@ class SAM2VideoPredictor(SAM2Base):
         return consolidated_out
 
     @torch.inference_mode()
-    def propagate_in_video_preflight(self, inference_state):
+    def propagate_in_video_preflight(self, inference_state, kernel_size=3, iters=0):
         """Prepare inference_state and consolidate temporary outputs before tracking."""
         # Check and make sure that every object has received input points or masks.
         batch_size = self._get_obj_num(inference_state)
@@ -553,6 +581,8 @@ class SAM2VideoPredictor(SAM2Base):
                             object_score_logits=out["object_score_logits"],
                             # these frames are what the user interacted with
                             is_mask_from_pts=True,
+                            kernel_size=kernel_size,
+                            iters=iters,
                         )
                         out["maskmem_features"] = maskmem_features
                         out["maskmem_pos_enc"] = maskmem_pos_enc
@@ -588,9 +618,13 @@ class SAM2VideoPredictor(SAM2Base):
         reverse=False,
         sup_maskmem_features=None,
         sup_maskmem_pos_enc=None,
+        sup_maskmem_features_neg=None,
+        sup_maskmem_pos_enc_neg=None,
+        kernel_size=3,
+        iters=0,
     ):
         """Propagate the input points across frames to track in the entire video."""
-        self.propagate_in_video_preflight(inference_state)
+        self.propagate_in_video_preflight(inference_state,kernel_size=kernel_size, iters=iters)
 
         obj_ids = inference_state["obj_ids"]
         num_frames = inference_state["num_frames"]
@@ -651,6 +685,10 @@ class SAM2VideoPredictor(SAM2Base):
                         run_mem_encoder=True,
                         sup_maskmem_features=sup_maskmem_features,
                         sup_maskmem_pos_enc=sup_maskmem_pos_enc,
+                        sup_maskmem_features_neg=sup_maskmem_features_neg,
+                        sup_maskmem_pos_enc_neg=sup_maskmem_pos_enc_neg,
+                        kernel_size=kernel_size,
+                        iters=iters,
                     )
                     obj_output_dict[storage_key][frame_idx] = current_out
 
@@ -790,6 +828,10 @@ class SAM2VideoPredictor(SAM2Base):
         sup_fg_feat=None,
         sup_maskmem_features=None,
         sup_maskmem_pos_enc=None,
+        sup_maskmem_features_neg=None,
+        sup_maskmem_pos_enc_neg=None,
+        kernel_size = 3,
+        iters = 0,
     ):
         """Run tracking on a single frame based on current inputs and previous memory."""
         # Retrieve correct image features
@@ -819,6 +861,10 @@ class SAM2VideoPredictor(SAM2Base):
             sup_fg_feat=sup_fg_feat,
             sup_maskmem_features=sup_maskmem_features,
             sup_maskmem_pos_enc=sup_maskmem_pos_enc,
+            sup_maskmem_features_neg=sup_maskmem_features_neg,
+            sup_maskmem_pos_enc_neg=sup_maskmem_pos_enc_neg,
+            kernel_size = kernel_size,
+            iters = iters,
         )
 
         # optionally offload the output to CPU memory to save GPU space
@@ -859,6 +905,8 @@ class SAM2VideoPredictor(SAM2Base):
         high_res_masks,
         object_score_logits,
         is_mask_from_pts,
+        kernel_size=3,
+        iters=0,
     ):
         """
         Run the memory encoder on `high_res_masks`. This is usually after applying
@@ -875,6 +923,8 @@ class SAM2VideoPredictor(SAM2Base):
             pred_masks_high_res=high_res_masks,
             object_score_logits=object_score_logits,
             is_mask_from_pts=is_mask_from_pts,
+            kernel_size=kernel_size,
+            iters=iters,
         )
 
         # optionally offload the output to CPU memory to save GPU space
@@ -1216,6 +1266,16 @@ class SAM2VideoPredictorVOS(SAM2VideoPredictor):
             obj_ptr,
             object_score_logits,
         )
+    def soft_erosion(self, x: torch.Tensor, k: int = 3, iters: int = 1) -> torch.Tensor:
+        """
+        x: float tensor in [0,1], shape [B,C,H,W]
+        """
+        if k <= 1 or iters <= 0:
+            return x
+        pad = k // 2
+        for _ in range(iters):
+            x = -F.max_pool2d(-x, kernel_size=k, stride=1, padding=pad)
+        return x
 
     def _encode_new_memory(
         self,
@@ -1224,6 +1284,8 @@ class SAM2VideoPredictorVOS(SAM2VideoPredictor):
         pred_masks_high_res,
         object_score_logits,
         is_mask_from_pts,
+        iters = 0,
+        kernel_size: int = 3,
     ):
         """
         Identical to the corresponding method in the parent (SAM2VideoPredictor), but
@@ -1244,6 +1306,9 @@ class SAM2VideoPredictorVOS(SAM2VideoPredictor):
         # scale the raw mask logits with a temperature before applying sigmoid
         binarize = self.binarize_mask_from_pts_for_mem_enc and is_mask_from_pts
         if binarize and not self.training:
+            if iters > 0:
+                # apply soft erosion to get cleaner mask for memory encoding
+                pred_masks_high_res = self.soft_erosion(pred_masks_high_res, iters=iters, k=kernel_size)
             mask_for_mem = (pred_masks_high_res > 0).float()
         else:
             # apply sigmoid on the raw mask logits to turn them into range (0, 1)

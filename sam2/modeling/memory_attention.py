@@ -63,11 +63,13 @@ class MemoryAttentionLayer(nn.Module):
         tgt = tgt + self.dropout1(tgt2)
         return tgt
 
-    def _forward_ca(self, tgt, memory, query_pos, pos, num_k_exclude_rope=0):
+    def _forward_ca(self, tgt, memory, query_pos, pos, num_k_exclude_rope=0, num_neg_tokens: int | None = None):
         kwds = {}
         if num_k_exclude_rope > 0:
             assert isinstance(self.cross_attn_image, RoPEAttention)
             kwds = {"num_k_exclude_rope": num_k_exclude_rope}
+            if num_neg_tokens is not None:
+                kwds["num_neg_tokens"] = num_neg_tokens
 
         # Cross-Attention
         tgt2 = self.norm2(tgt)
@@ -87,11 +89,12 @@ class MemoryAttentionLayer(nn.Module):
         pos: Optional[Tensor] = None,
         query_pos: Optional[Tensor] = None,
         num_k_exclude_rope: int = 0,
+        num_neg_tokens: int | None = None,
     ) -> torch.Tensor:
 
         # Self-Attn, Cross-Attn
         tgt = self._forward_sa(tgt, query_pos)
-        tgt = self._forward_ca(tgt, memory, query_pos, pos, num_k_exclude_rope)
+        tgt = self._forward_ca(tgt, memory, query_pos, pos, num_k_exclude_rope, num_neg_tokens=num_neg_tokens)
         # MLP
         tgt2 = self.norm3(tgt)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
@@ -123,6 +126,7 @@ class MemoryAttention(nn.Module):
         curr_pos: Optional[Tensor] = None,  # pos_enc for self-attention inputs
         memory_pos: Optional[Tensor] = None,  # pos_enc for cross-attention inputs
         num_obj_ptr_tokens: int = 0,  # number of object pointer *tokens*
+        num_neg_tokens: int | None = None,
     ):
         if isinstance(curr, list):
             assert isinstance(curr_pos, list)
@@ -157,6 +161,7 @@ class MemoryAttention(nn.Module):
                 memory=memory,
                 pos=memory_pos,
                 query_pos=curr_pos,
+                num_neg_tokens=num_neg_tokens,
                 **kwds,
             )
         normed_output = self.norm(output)

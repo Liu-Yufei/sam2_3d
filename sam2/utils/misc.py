@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from PIL import Image
 from tqdm import tqdm
-
+import torch.nn.functional as F
 
 def get_sdpa_settings():
     if torch.cuda.is_available():
@@ -168,6 +168,29 @@ class AsyncVideoFrameLoader:
     def __len__(self):
         return len(self.images)
 
+def batch_erode(masks, pixels=5):
+    """
+    对形状为 [B, C, H, W] 的张量进行批量腐蚀
+    masks: 0/1 张量 (或先进行 > 0.5 处理)
+    pixels: 腐蚀像素数
+    """
+    B, C, H, W = masks.shape
+    k_size = 2 * pixels + 1
+    
+    # 1. 创建深度卷积核 (Groups = C)
+    # 每个通道使用独立的 11x11 全 1 卷积核
+    kernel = torch.ones((C, 1, k_size, k_size), device=masks.device, dtype=masks.dtype)
+    
+    # 2. 卷积计算
+    # groups=C 是关键，确保通道间独立运算
+    padding = pixels
+    counts = F.conv2d(masks, kernel, padding=padding, groups=C)
+    
+    # 3. 判定腐蚀结果
+    # 只有区域内所有点都是 1（总和等于卷积核面积）的点才保留为 1
+    eroded_masks = (counts == (k_size**2)).float()
+    
+    return eroded_masks
 
 def load_video_frames(
     video_path,
@@ -175,10 +198,12 @@ def load_video_frames(
     offload_video_to_cpu,
     frame_list=None,
     mask_path=None,
+    erode_mask_path=None,
     img_mean=(0.485, 0.456, 0.406),
     img_std=(0.229, 0.224, 0.225),
     async_loading_frames=False,
     compute_device=torch.device("cuda"),
+    use_erode_mask=False,
 ):
     """
     Load the video frames from video_path. The frames are resized to image_size as in
@@ -200,6 +225,7 @@ def load_video_frames(
         return load_video_frames_from_jpg_images(
             video_path=video_path,
             mask_path=mask_path,
+            erode_mask_path=erode_mask_path,
             image_size=image_size,
             frame_list=frame_list,
             offload_video_to_cpu=offload_video_to_cpu,
@@ -207,6 +233,7 @@ def load_video_frames(
             img_std=img_std,
             async_loading_frames=async_loading_frames,
             compute_device=compute_device,
+            use_erode_mask=use_erode_mask,
         )
     else:
         raise NotImplementedError(
@@ -221,10 +248,12 @@ def load_video_frames_from_jpg_images(
     offload_video_to_cpu,
     frame_list=None,
     mask_path=None,
+    erode_mask_path=None,
     img_mean=(0.485, 0.456, 0.406),
     img_std=(0.229, 0.224, 0.225),
     async_loading_frames=False,
     compute_device=torch.device("cuda"),
+    use_erode_mask=False,
 ):
     """
     Load the video frames from a directory of JPEG files ("<frame_index>.jpg" format).
@@ -259,7 +288,10 @@ def load_video_frames_from_jpg_images(
     if num_frames == 0:
         raise RuntimeError(f"no images found in {jpg_folder}")
     img_paths = [os.path.join(jpg_folder, frame_name) for frame_name in frame_names]
-    mask_paths = [os.path.join(mask_path, frame_name.replace('.jpg','.png')) for frame_name in frame_names] if mask_path is not None else None
+    if mask_path is not None:
+        mask_paths = [os.path.join(mask_path, frame_name.replace('.jpg','.png')) for frame_name in frame_names] if mask_path is not None else None
+    if erode_mask_path is not None:
+        erode_mask_paths = [os.path.join(erode_mask_path, frame_name.replace('.jpg','.png')) for frame_name in frame_names] if erode_mask_path is not None else None
     img_mean = torch.tensor(img_mean, dtype=torch.float32)[:, None, None]
     img_std = torch.tensor(img_std, dtype=torch.float32)[:, None, None]
 
@@ -275,25 +307,40 @@ def load_video_frames_from_jpg_images(
         return lazy_images, lazy_images.video_height, lazy_images.video_width
 
     images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float32)
-    if mask_paths is not None:
+    if mask_path is not None:
         masks = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float32)
+        if use_erode_mask:
+            erode_masks = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float32)    
     for n, img_path in enumerate(tqdm(img_paths, desc="frame loading (JPEG)")):
         images[n], video_height, video_width = _load_img_as_tensor(img_path, image_size)
-        if mask_paths is not None:
+        if mask_path is not None:
             masks[n], _, _ = _load_img_as_tensor(mask_paths[n], image_size)
+            if use_erode_mask:
+                erode_masks[n], _, _ = _load_img_as_tensor(erode_mask_paths[n], image_size)
             # images[n] = torch.cat([images[n], mask[0:1]], dim=0)  # add mask as 4th channel
+    if mask_path is not None:
+        # masks=torch.where(masks>0.5,1.0,0.0)
+        if use_erode_mask:
+            erode_masks=torch.where(erode_masks>0.5,1.0,0.0)
+
     if not offload_video_to_cpu:
         images = images.to(compute_device)
         img_mean = img_mean.to(compute_device)
         img_std = img_std.to(compute_device)
-        if mask_paths is not None:
+        if mask_path is not None:
             masks = masks.to(compute_device)
+            if use_erode_mask:
+                erode_masks = erode_masks.to(compute_device)
     # normalize by mean and std
     images -= img_mean
     images /= img_std
-    if mask_paths is not None:
+    if mask_path is not None:
         masks -= img_mean
         masks /= img_std
+        if use_erode_mask:
+            erode_masks -= img_mean
+            erode_masks /= img_std
+            return images, video_height, video_width, masks, erode_masks
         return images, video_height, video_width, masks
     return images, video_height, video_width
 

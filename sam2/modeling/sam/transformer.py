@@ -272,8 +272,57 @@ class RoPEAttention(Attention):
         )
         self.rope_k_repeat = rope_k_repeat
 
+
+    # def scaled_dot_product_attention_neg_suppression(
+    #     self,
+    #     q: Tensor,
+    #     k: Tensor,
+    #     v: Tensor,
+    #     dropout_p: float = 0.0,
+    #     num_neg_tokens: int = 0,
+    #     neg_lambda: float = -1,
+    #     num_k_rope: int = 0,
+    # ) -> Tensor:
+    #     """
+    #     Scaled dot-product attention with negative suppression.
+    #     Assumes key, value are ordered as:
+    #         [ positive memory | negative memory ]
+    #     Negative memory participates in attention score suppression only,
+    #     and does NOT contribute to values.
+    #     """
+
+    #     # ===== split pos / neg memory =====
+    #     k_pos_all = k[:, :, :-num_neg_tokens] # mem, pos, ptr, neg
+    #     v_pos_all = v[:, :, :-num_neg_tokens]
+
+    #     k_neg = k[:, :, -num_neg_tokens:]
+    #     k_pos = k[:, :, -(num_neg_tokens+num_k_rope):-num_k_rope]
+
+    #     # ===== attention scores =====
+    #     scale = 1.0 / math.sqrt(k_pos_all.shape[-1])
+    #     score_pos = torch.matmul(q, k_pos_all.transpose(-2, -1)) * scale
+
+    #     if k_neg.numel() > 0:
+    #         score_neg = torch.matmul(q, k_neg.transpose(-2, -1)) * scale
+    #         score_all = torch.matmul(q, k_pos_all.transpose(-2, -1)) * scale
+    #         score_modify = score_all[:, :, : , -num_k_rope:-(num_k_rope-num_neg_tokens)] - neg_lambda * score_neg
+    #         score = torch.cat([score_all[:, :, :, :-num_k_rope], score_modify,score_all[:, :, :,-(num_k_rope-num_neg_tokens):]], dim=-1)
+    #     else:
+    #         score = score_pos
+
+    #     # ===== softmax & dropout =====
+    #     attn = score.softmax(dim=-1)
+    #     if dropout_p > 0:
+    #         attn = F.dropout(attn, p=dropout_p)
+
+    #     # ===== output (positive values only) =====
+    #     out = torch.matmul(attn, v_pos_all)
+    #     return out
+
     def forward(
-        self, q: Tensor, k: Tensor, v: Tensor, num_k_exclude_rope: int = 0
+        self, q: Tensor, k: Tensor, v: Tensor, num_k_exclude_rope: int = 0,
+        num_neg_tokens: int | None = None,
+        neg_lambda: float  = -1,
     ) -> Tensor:
         # Input projections
         q = self.q_proj(q)
@@ -303,7 +352,13 @@ class RoPEAttention(Attention):
 
         dropout_p = self.dropout_p if self.training else 0.0
         # Attention
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+        # if num_neg_tokens is not None:
+        #     out = self.scaled_dot_product_attention_neg_suppression(
+        #         q, k, v, dropout_p=dropout_p, num_neg_tokens=num_neg_tokens, neg_lambda=neg_lambda, num_k_rope=num_k_rope
+        #     )
+        # else:
+        if True:
+            out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
 
         out = self._recombine_heads(out)
         out = self.out_proj(out)
