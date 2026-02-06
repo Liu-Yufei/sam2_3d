@@ -468,6 +468,36 @@ def metrics(final_mask, test_mask):
     dice_score = 2 * intersection / (np.sum(final_mask) + np.sum(test_mask))
     return dice_score
 
+def select_remove_idx(score_list, masks):
+    remove_idx = []
+    for i in range(3):
+        others = [j for j in range(3) if j != i]
+        intersection1 = (masks[i] * masks[others[0]]).sum()
+        intersection2 = (masks[i] * masks[others[1]]).sum()
+        keep = (intersection1 > 0) or (intersection2 > 0)
+        if not keep:
+            remove_idx.append(i)
+        elif score_list[i] < 0.6:
+            remove_idx.append(i)
+        
+    if len(remove_idx) == 3:
+        if torch.var(torch.tensor(score_list)) > 0.008:
+        # 假如分数差距很大，说明最大的未必准确，转而选理论上面积最大的
+            remove_idx.pop(1)
+        else:
+            max_idx = max(range(len(score_list)), key=lambda i: score_list[i])
+            remove_idx.pop(max_idx)
+    
+    if ((masks[1].sum() < masks[0].sum() / 2) and (score_list[0] >=0.5)) or ((masks[1].sum() < masks[2].sum() / 2) and (score_list[2] >=0.55)) and (1 not in remove_idx):
+        if 1 not in remove_idx:
+            if len(remove_idx) < 2:
+                remove_idx.append(1)
+            else:
+                max_idx = max(range(len(score_list)), key=lambda i: score_list[i])
+                remove_idx.pop(max_idx)
+    remove_idx = list(set(remove_idx))
+    return remove_idx
+
 def sam2_video_inference(
         args,
         ann_obj_frame_points, inference_state, 
@@ -521,34 +551,7 @@ def sam2_video_inference(
                 plt.close()
                 masks.append((out_mask_logits[out_obj_ids.index(ann_obj_id)] > 0.0))
             # break
-        remove_idx = []
-        for i in range(3):
-            others = [j for j in range(3) if j != i]
-            intersection1 = (masks[i] * masks[others[0]]).sum()
-            intersection2 = (masks[i] * masks[others[1]]).sum()
-            keep = (intersection1 > 0) or (intersection2 > 0)
-            if not keep:
-                remove_idx.append(i)
-            elif score_list[i] < 0.6:
-                remove_idx.append(i)
-            
-        if len(remove_idx) == 3:
-            if torch.var(torch.tensor(score_list)) > 0.008:
-            # 假如分数差距很大，说明最大的未必准确，转而选理论上面积最大的
-                remove_idx.pop(1)
-            else:
-                max_idx = max(range(len(score_list)), key=lambda i: score_list[i])
-                remove_idx.pop(max_idx)
-        
-        if ((masks[1].sum() < masks[0].sum() / 2) and (score_list[0] >=0.5)) or ((masks[1].sum() < masks[2].sum() / 2) and (score_list[2] >=0.55)) and (1 not in remove_idx):
-            if 1 not in remove_idx:
-                if len(remove_idx) < 2:
-                    remove_idx.append(1)
-                else:
-                    max_idx = max(range(len(score_list)), key=lambda i: score_list[i])
-                    remove_idx.pop(max_idx)
-        remove_idx = list(set(remove_idx))
-
+        remove_idx = select_remove_idx(score_list, masks)
         # 移除分数最低的点
         if (len(remove_idx) > 0):
             # list.index(x) 会返回 x 在列表中第一次出现的索引
