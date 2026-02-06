@@ -489,6 +489,7 @@ def sam2_video_inference(
         ann_obj_id = 0
         frame_points = ann_obj_frame_points
         score_list = []
+        masks = []
         for i, (ann_frame_idx, (points, labels)) in enumerate(frame_points.items()):
             _, out_obj_ids, out_mask_logits, mask_scores = predictor.add_new_points_or_box(
                 inference_state=inference_state,
@@ -518,16 +519,42 @@ def sam2_video_inference(
                 show_mask((out_mask_logits[out_obj_ids.index(ann_obj_id)] > 0.0).cpu().numpy(), plt.gca(), obj_id=ann_obj_id)
                 plt.savefig(output_path_fig)
                 plt.close()
+                masks.append((out_mask_logits[out_obj_ids.index(ann_obj_id)] > 0.0))
             # break
+        remove_idx = []
+        for i in range(3):
+            others = [j for j in range(3) if j != i]
+            intersection1 = (masks[i] * masks[others[0]]).sum()
+            intersection2 = (masks[i] * masks[others[1]]).sum()
+            keep = (intersection1 > 0) or (intersection2 > 0)
+            if not keep:
+                remove_idx.append(i)
+            elif score_list[i] < 0.6:
+                remove_idx.append(i)
+            
+        if len(remove_idx) == 3:
+            if torch.var(torch.tensor(score_list)) > 0.008:
+            # 假如分数差距很大，说明最大的未必准确，转而选理论上面积最大的
+                remove_idx.pop(1)
+            else:
+                max_idx = max(range(len(score_list)), key=lambda i: score_list[i])
+                remove_idx.pop(max_idx)
         
+        if ((masks[1].sum() < masks[0].sum() / 2) and (score_list[0] >=0.5)) or ((masks[1].sum() < masks[2].sum() / 2) and (score_list[2] >=0.55)) and (1 not in remove_idx):
+            if 1 not in remove_idx:
+                if len(remove_idx) < 2:
+                    remove_idx.append(1)
+                else:
+                    max_idx = max(range(len(score_list)), key=lambda i: score_list[i])
+                    remove_idx.pop(max_idx)
+        remove_idx = list(set(remove_idx))
+
         # 移除分数最低的点
-        min_val = min(score_list)
-        if min_val < 60:
+        if (len(remove_idx) > 0):
             # list.index(x) 会返回 x 在列表中第一次出现的索引
-            remove_idx = score_list.index(min_val)
             predictor.reset_state(inference_state)
             for i, (ann_frame_idx, (points, labels)) in enumerate(frame_points.items()):
-                if i == remove_idx:
+                if i in remove_idx:
                     continue
                 _, out_obj_ids, out_mask_logits, mask_scores = predictor.add_new_points_or_box(
                     inference_state=inference_state,
