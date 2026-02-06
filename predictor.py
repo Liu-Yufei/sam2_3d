@@ -552,7 +552,7 @@ def sam2_video_inference(
                 masks.append((out_mask_logits[out_obj_ids.index(ann_obj_id)] > 0.0))
             # break
         remove_idx = select_remove_idx(score_list, masks)
-        # 移除分数最低的点
+
         if (len(remove_idx) > 0):
             # list.index(x) 会返回 x 在列表中第一次出现的索引
             predictor.reset_state(inference_state)
