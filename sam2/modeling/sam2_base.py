@@ -1023,6 +1023,7 @@ class SAM2Base(torch.nn.Module):
         is_mask_from_pts,
         iters = 0,
         kernel_size: int = 3,
+        erose_ratio: float = 0,
     ):
         """Encode the current image and its prediction into a memory feature."""
         B = current_vision_feats[-1].size(1)  # batch size on this frame
@@ -1040,10 +1041,16 @@ class SAM2Base(torch.nn.Module):
         # scale the raw mask logits with a temperature before applying sigmoid
         binarize = self.binarize_mask_from_pts_for_mem_enc and is_mask_from_pts
         if binarize and not self.training:
+            mask_for_mem = (pred_masks_high_res > 0).float()
             if iters > 0:
                 # apply soft erosion to get cleaner mask for memory encoding
-                pred_masks_high_res = self.soft_erosion(pred_masks_high_res, iters=iters, k=kernel_size)
-            mask_for_mem = (pred_masks_high_res > 0).float()
+                if erose_ratio > 0:
+                    area = torch.sum(mask_for_mem).item()  # scalar
+
+                    # 估算前景“宽度”（像素）
+                    est_radius = (area ** 0.5) * erose_ratio  # sqrt(area) * ratio ≈ 收缩像素量
+                    kernel_size = int(round(est_radius) * 2 + 1)  # 转为 kernel size，保证为奇数
+                mask_for_mem = self.soft_erosion(mask_for_mem, iters=iters, k=kernel_size)
         else:
             # apply sigmoid on the raw mask logits to turn them into range (0, 1)
             mask_for_mem = torch.sigmoid(pred_masks_high_res)
@@ -1151,6 +1158,7 @@ class SAM2Base(torch.nn.Module):
         current_out,
         kernel_size: int = 3,
         iters: int = 0,
+        erose_ratio: float = 0,
     ):
         if run_mem_encoder and self.num_maskmem > 0:
             high_res_masks_for_mem_enc = high_res_masks
@@ -1162,6 +1170,7 @@ class SAM2Base(torch.nn.Module):
                 is_mask_from_pts=(point_inputs is not None),
                 iters = iters,
                 kernel_size=kernel_size,
+                erose_ratio=erose_ratio,
             )
             current_out["maskmem_features"] = maskmem_features
             current_out["maskmem_pos_enc"] = maskmem_pos_enc
@@ -1196,6 +1205,7 @@ class SAM2Base(torch.nn.Module):
         sup_maskmem_pos_enc_neg=None,
         kernel_size: int = 3,
         iters: int = 0,
+        erose_ratio: float = 0,
     ):
         current_out, sam_outputs, _, _ = self._track_step(
             frame_idx,
@@ -1247,6 +1257,7 @@ class SAM2Base(torch.nn.Module):
             current_out,
             kernel_size=kernel_size,
             iters = iters,
+            erose_ratio=erose_ratio,
         )
 
         return current_out

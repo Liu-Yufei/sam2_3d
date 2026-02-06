@@ -42,7 +42,8 @@ def get_arguments():
     parser.add_argument('--calculate_score', type=bool, default=True)
     parser.add_argument('--use_erode_mask', type=bool, default=False)
     parser.add_argument('--kernel_size', type=int, default=5)
-    parser.add_argument('--iters', type=int, default=2)
+    parser.add_argument('--iters', type=int, default=1)
+    parser.add_argument('--erose_ratio', type=float, default=0.0)
     args = parser.parse_args()
     return args
 
@@ -532,6 +533,7 @@ def sam2_video_inference(
                 support_mask = inference_state['support_masks'][i],
                 kernel_size= args.kernel_size,
                 iters = args.iters,
+                erose_ratio = args.erose_ratio,
             )
             if show_result and (output_path is not None):
                 output_path_fig = os.path.join(output_path, f'frame_{ann_frame_idx:04d}_after_clicks.png')
@@ -570,6 +572,7 @@ def sam2_video_inference(
                     support_mask = inference_state['support_masks'][i],
                     kernel_size = args.kernel_size,
                     iters = args.iters,
+                    erose_ratio = args.erose_ratio,
                 )
                 # if show_result and (output_path is not None):
                 #     output_path_fig = os.path.join(output_path, f'frame_{ann_frame_idx:04d}_after_clicks.png')
@@ -599,6 +602,7 @@ def sam2_video_inference(
         sup_maskmem_pos_enc_neg=sup_maskmem_pos_enc_neg,
         iters = args.iters,
         kernel_size = args.kernel_size,
+        erose_ratio = args.erose_ratio,
     ):
         video_segments[out_frame_idx] = {
             out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
@@ -615,6 +619,7 @@ def sam2_video_inference(
         sup_maskmem_pos_enc_neg=sup_maskmem_pos_enc_neg,
         kernel_size = args.kernel_size,
         iters = args.iters,
+        erose_ratio = args.erose_ratio,
     ):  
         video_segments[out_frame_idx] = {  
             out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()  
@@ -798,6 +803,7 @@ def main():
                             is_mask_from_pts=True,
                             kernel_size=args.kernel_size,
                             iters=args.iters,
+                            erose_ratio = args.erose_ratio,
                         )
                         sup_maskmem_features.append(maskmem_features)
                         sup_maskmem_pos_enc.append(maskmem_pos_enc[0])
@@ -812,6 +818,7 @@ def main():
                             is_mask_from_pts=True,
                             kernel_size=args.kernel_size,
                             iters=args.iters,
+                            erose_ratio = args.erose_ratio,
                         )
                         sup_maskmem_features_neg.append(maskmem_features_neg)
                         sup_maskmem_pos_enc_neg.append(maskmem_pos_enc_neg[0])
